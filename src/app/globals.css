@@ -1,26 +1,74 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --background: #faf6ef;
+  --surface: #ffffff;
+  --surface-muted: #f2ece0;
+  --foreground: #262322;
+  --foreground-muted: #5d5751;
+  --border: #e4dccb;
+  --primary: #b5613f;
+  --primary-foreground: #fdf8f2;
+  --primary-hover: #9c4f31;
+  --accent-green: #5c7a5e;
+  --accent-green-foreground: #f2f7f2;
+  --danger: #a4413a;
+  --ring: #b5613f;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --background: #1c1a18;
+    --surface: #262322;
+    --surface-muted: #2f2b28;
+    --foreground: #f2ece0;
+    --foreground-muted: #b8afa3;
+    --border: #3c3733;
+    --primary: #d17a54;
+    --primary-foreground: #241a14;
+    --primary-hover: #e08e69;
+    --accent-green: #7fa082;
+    --accent-green-foreground: #14201a;
+    --danger: #d17a72;
+    --ring: #d17a54;
   }
 }
 
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-muted: var(--surface-muted);
+  --color-foreground: var(--foreground);
+  --color-foreground-muted: var(--foreground-muted);
+  --color-border: var(--border);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-hover: var(--primary-hover);
+  --color-accent-green: var(--accent-green);
+  --color-accent-green-foreground: var(--accent-green-foreground);
+  --color-danger: var(--danger);
+  --color-ring: var(--ring);
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+}
+
+* {
+  border-color: var(--color-border);
+}
+
+/* Safe-area support for future mobile-app wrapping */
+.safe-top {
+  padding-top: env(safe-area-inset-top);
+}
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom);
 }

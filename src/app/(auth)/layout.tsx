@@ -1,0 +1,13 @@
+export default function AuthLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex min-h-dvh flex-col items-center justify-center bg-background px-6 py-12 safe-top safe-bottom">
+      <div className="w-full max-w-sm">
+        <div className="mb-8 text-center">
+          <p className="text-xs font-semibold uppercase tracking-wide text-primary">Virtual Communication Coach</p>
+          <h1 className="mt-2 text-2xl font-semibold text-foreground">Practise the conversation before you have it.</h1>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
