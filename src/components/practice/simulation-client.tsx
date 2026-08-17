@@ -2,7 +2,7 @@
 
 import { useEffect, useReducer, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Lightbulb, Mic, Send, Square, Type } from "lucide-react";
+import { Lightbulb, Mic, Send, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/input";
 import { Transcript, type TranscriptMessage } from "@/components/practice/transcript";
@@ -43,7 +43,6 @@ export function SimulationClient({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [remaining, setRemaining] = useState(() => computeRemainingSeconds(startedAtIso, durationSeconds));
   const [voiceAvailable, setVoiceAvailable] = useState(initialVoiceAvailable);
-  const [showTextInput, setShowTextInput] = useState(!initialVoiceAvailable);
   const endTriggered = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -196,7 +195,6 @@ export function SimulationClient({
       dispatch({ type: "START_RECORDING" });
     } catch {
       setErrorMessage("Microphone access was denied. You can still type your response below.");
-      setShowTextInput(true);
     }
   }
 
@@ -219,10 +217,7 @@ export function SimulationClient({
       formData.append("audio", blob, "recording.webm");
       const res = await fetch("/api/voice/stt", { method: "POST", body: formData });
       if (!res.ok) {
-        if (res.status === 503) {
-          setVoiceAvailable(false);
-          setShowTextInput(true);
-        }
+        if (res.status === 503) setVoiceAvailable(false);
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error || "Couldn't transcribe your recording.");
       }
@@ -321,63 +316,49 @@ export function SimulationClient({
       ) : null}
 
       {!isEnding ? (
-        <div className="sticky bottom-16 flex flex-col gap-3 border-t border-border bg-background pt-3">
-          {voiceAvailable && !showTextInput ? (
-            <div className="flex flex-col items-center gap-2 py-2">
+        <div className="sticky bottom-16 flex flex-col gap-2 border-t border-border bg-background pt-3">
+          <form onSubmit={handleSubmit} className="flex items-end gap-2">
+            <Textarea
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSubmit(e);
+                }
+              }}
+              placeholder={isRecording ? "Recording…" : "Type your response…"}
+              rows={1}
+              className="max-h-32 min-h-11 flex-1 resize-none"
+              disabled={!canInteract}
+              aria-label="Your message"
+            />
+            {voiceAvailable ? (
               <button
                 type="button"
                 onClick={isRecording ? stopRecording : startRecording}
                 disabled={!canInteract && !isRecording}
-                aria-label={isRecording ? "Stop recording" : "Start recording"}
+                aria-label={isRecording ? "Stop recording" : "Record a voice message"}
                 className={cn(
-                  "flex h-16 w-16 items-center justify-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
-                  isRecording ? "bg-danger text-primary-foreground animate-pulse" : "bg-primary text-primary-foreground disabled:opacity-50",
+                  "flex h-11 w-11 shrink-0 items-center justify-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:opacity-50",
+                  isRecording
+                    ? "bg-danger text-primary-foreground animate-pulse"
+                    : "bg-surface-muted text-foreground-muted hover:bg-border hover:text-foreground",
                 )}
               >
-                {isRecording ? <Square className="h-6 w-6" /> : <Mic className="h-6 w-6" />}
+                {isRecording ? <Square className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
               </button>
-              <p className="text-xs text-foreground-muted">
-                {isRecording ? "Tap to stop" : canInteract ? "Tap to speak" : "Please wait…"}
-              </p>
-              <button
-                type="button"
-                onClick={() => setShowTextInput(true)}
-                className="flex items-center gap-1 text-xs font-medium text-foreground-muted underline"
-              >
-                <Type className="h-3 w-3" /> Type instead
-              </button>
-            </div>
-          ) : (
-            <form onSubmit={handleSubmit} className="flex items-end gap-2">
-              <Textarea
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    handleSubmit(e);
-                  }
-                }}
-                placeholder="Type your response…"
-                rows={1}
-                className="max-h-32 min-h-11 flex-1 resize-none"
-                disabled={!canInteract}
-                aria-label="Your message"
-              />
-              <Button type="submit" size="icon" disabled={!canInteract || !input.trim()} aria-label="Send message">
-                <Send className="h-4 w-4" />
-              </Button>
-            </form>
-          )}
+            ) : null}
+            <Button type="submit" size="icon" disabled={!canInteract || !input.trim() || isRecording} aria-label="Send message">
+              <Send className="h-4 w-4" />
+            </Button>
+          </form>
 
-          {voiceAvailable && showTextInput ? (
-            <button
-              type="button"
-              onClick={() => setShowTextInput(false)}
-              className="flex items-center justify-center gap-1 text-xs font-medium text-foreground-muted underline"
-            >
-              <Mic className="h-3 w-3" /> Use voice instead
-            </button>
+          {isRecording ? (
+            <p className="flex items-center gap-1.5 text-xs font-medium text-danger" role="status">
+              <span className="h-1.5 w-1.5 rounded-full bg-danger animate-pulse" aria-hidden="true" />
+              Recording… tap the mic to stop
+            </p>
           ) : null}
 
           <div className="flex items-center justify-between gap-2">
