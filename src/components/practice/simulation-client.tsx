@@ -105,8 +105,12 @@ export function SimulationClient({
           body: JSON.stringify({ sessionId, text: lastMessage.text }),
         });
         if (!res.ok) {
-          if (res.status === 503) setVoiceAvailable(false);
-          throw new Error("tts unavailable");
+          const body = (await res.json().catch(() => ({}))) as { error?: string; code?: string };
+          // Only a genuinely unconfigured provider should turn voice off for the rest of the
+          // session — every other failure (quota, rate limit, network, etc.) is a single failed
+          // attempt and must stay retryable on the next turn.
+          if (body.code === "not_configured") setVoiceAvailable(false);
+          throw new Error(body.error || "Couldn't play the AI's voice reply. Continuing with text.");
         }
         const { audioBase64, mimeType } = (await res.json()) as { audioBase64: string; mimeType: string };
         const audio = new Audio(`data:${mimeType};base64,${audioBase64}`);
@@ -114,8 +118,13 @@ export function SimulationClient({
         audio.onended = () => !cancelled && dispatch({ type: "SPEECH_FINISHED" });
         audio.onerror = () => !cancelled && dispatch({ type: "SPEECH_FINISHED" });
         await audio.play();
-      } catch {
-        if (!cancelled) dispatch({ type: "SPEECH_FINISHED" });
+      } catch (error) {
+        if (!cancelled) {
+          // Never block the conversation on a TTS failure — the text is already in the
+          // transcript, so surface the problem and move on rather than going silent.
+          setErrorMessage(error instanceof Error ? error.message : "Couldn't play the AI's voice reply. Continuing with text.");
+          dispatch({ type: "SPEECH_FINISHED" });
+        }
       }
     }
 
@@ -217,8 +226,10 @@ export function SimulationClient({
       formData.append("audio", blob, "recording.webm");
       const res = await fetch("/api/voice/stt", { method: "POST", body: formData });
       if (!res.ok) {
-        if (res.status === 503) setVoiceAvailable(false);
-        const body = await res.json().catch(() => ({}));
+        const body = (await res.json().catch(() => ({}))) as { error?: string; code?: string };
+        // Only a genuinely unconfigured provider should turn voice off for the rest of the
+        // session — every other failure is a single failed attempt and must stay retryable.
+        if (body.code === "not_configured") setVoiceAvailable(false);
         throw new Error(body.error || "Couldn't transcribe your recording.");
       }
       const { text } = (await res.json()) as { text: string };

@@ -10,7 +10,10 @@ export class MockSpeechToTextProvider implements SpeechToTextProvider {
   readonly name = "mock";
 
   async transcribe(): Promise<TranscriptionResult> {
-    throw new VoiceProviderError("Voice input isn't available in demo mode — configure OPENAI_API_KEY to enable it.");
+    throw new VoiceProviderError(
+      "Voice input isn't available in demo mode — configure OPENAI_API_KEY to enable it.",
+      "not_configured",
+    );
   }
 }
 
@@ -18,6 +21,9 @@ export class MockTextToSpeechProvider implements TextToSpeechProvider {
   readonly name = "mock";
 
   async synthesize(): Promise<SpeechResult> {
-    throw new VoiceProviderError("Voice playback isn't available in demo mode — configure OPENAI_API_KEY to enable it.");
+    throw new VoiceProviderError(
+      "Voice playback isn't available in demo mode — configure OPENAI_API_KEY to enable it.",
+      "not_configured",
+    );
   }
 }

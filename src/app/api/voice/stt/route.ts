@@ -3,6 +3,7 @@ import { createClient } from "@/lib/supabase/server";
 import { requireOwnedSession, ApiError } from "@/lib/practice/authorize";
 import { getSpeechToTextProvider } from "@/lib/voice";
 import { VoiceProviderError } from "@/lib/voice/types";
+import { voiceErrorResponseBody } from "@/lib/voice/errorResponse";
 
 export const runtime = "nodejs";
 
@@ -32,9 +33,13 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: error.message }, { status: error.status });
     }
     if (error instanceof VoiceProviderError) {
-      return NextResponse.json({ error: error.message }, { status: 503 });
+      const { status, ...body } = voiceErrorResponseBody(error.code);
+      return NextResponse.json(body, { status });
     }
-    console.error("voice/stt failed", error instanceof Error ? error.message : error);
-    return NextResponse.json({ error: "Couldn't transcribe that. Please try typing instead." }, { status: 500 });
+    console.error("[voice:stt] unexpected route failure", error instanceof Error ? error.message : error);
+    return NextResponse.json(
+      { error: "Couldn't transcribe that. Please try typing instead.", code: "unknown" },
+      { status: 500 },
+    );
   }
 }
