@@ -66,6 +66,7 @@ describe("metricsPayloadSchema", () => {
       serverAudioEndMs: null,
       transcript: "Sure, let's do that.",
       transcriptionFailed: false,
+      audibleAiResponseIdAtStart: null,
     });
 
     const result = metricsPayloadSchema.safeParse(payload);
@@ -170,6 +171,7 @@ describe("mapMetricsPayloadToTurnEvents", () => {
       serverAudioEndMs: 1500.3,
       transcript: "Okay.",
       transcriptionFailed: false,
+      audibleAiResponseIdAtStart: null,
     });
     payload.aiTurns.push({
       turnIndex: 1,
@@ -227,6 +229,7 @@ describe("mapMetricsPayloadToTurnEvents", () => {
       serverAudioEndMs: null,
       transcript: "Right.",
       transcriptionFailed: false,
+      audibleAiResponseIdAtStart: null,
     });
 
     const [event] = mapMetricsPayloadToTurnEvents(payload);
@@ -300,6 +303,7 @@ describe("mapMetricsPayloadToSessionMetrics", () => {
       serverAudioEndMs: null,
       transcript: "Yes, that works.",
       transcriptionFailed: false,
+      audibleAiResponseIdAtStart: null,
     });
     raw.session.userTurnCount = 1;
     raw.session.avgUserTurnDurationMs = 800;

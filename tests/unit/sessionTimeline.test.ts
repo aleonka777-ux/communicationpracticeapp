@@ -411,6 +411,7 @@ describe("createSessionTimeline", () => {
       "serverAudioEndMs",
       "transcript",
       "transcriptionFailed",
+      "audibleAiResponseIdAtStart",
       "responseId",
       "wasInterrupted",
       "responseStatus",
@@ -1039,5 +1040,156 @@ describe("createSessionTimeline — AI turn lifecycle integrity", () => {
     // Latency must be measured against resp_2 (the turn the user actually heard just before
     // replying), not resp_1 (which ended much earlier and is unrelated to this exchange).
     expect(snapshot.session.avgUserResponseLatencyMs).toBe(600);
+  });
+});
+
+/**
+ * Regression coverage for a production control test: one deliberate, audible interruption came
+ * back as confirmed_interruption_count = 0 and overlap = 0.8ms across 2 events. Root cause:
+ * audible-vs-pre_playback classification and attribution were computed by re-reading
+ * currentAiResponseId/pendingResponseId at CONFIRMATION time (250ms-1500ms after speech started),
+ * not at the moment the candidate interruption interval actually began — by confirmation time the
+ * AI turn may have already closed for a reason unrelated to the interruption, silently
+ * misclassifying a genuine mid-playback interruption as pre_playback. Fixed by snapshotting
+ * currentAiResponseId/pendingResponseId onto the user turn at recordUserSpeechStarted() time and
+ * reading that snapshot, not live state, in recordConfirmedBargeIn(). Overlap/response latency
+ * were independently re-verified to already use only the client monotonic clock end to end (never
+ * mixing in the server's separate audio_start_ms/audio_end_ms clock), so no cross-clock bug was
+ * found there — the near-zero overlap was a downstream symptom of the same misclassification, not
+ * a separate defect.
+ */
+describe("createSessionTimeline — audible classification uses state at speech-start, not confirmation time", () => {
+  it("classifies a genuine mid-playback interruption as audible even if the AI turn closes before confirmation fires (reproduces the production event ordering)", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(100);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(500);
+    // User starts speaking while resp_1 is genuinely, audibly playing.
+    timeline.recordUserSpeechStarted("item_1");
+
+    // Before the barge-in controller's confirmation timer elapses, resp_1 closes for a reason
+    // unrelated to this interruption (e.g. it happened to finish at nearly the same moment) — the
+    // exact scenario that made the OLD "check state now" logic misclassify this as pre_playback.
+    clock.advance(50);
+    timeline.recordAiAudioStopped("resp_1");
+    timeline.recordResponseDone("resp_1", "completed");
+
+    // The confirmation timer fires later, well after resp_1 has already closed.
+    clock.advance(200);
+    timeline.recordConfirmedBargeIn();
+    clock.advance(300);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Wait, I wanted to say something.");
+
+    const snapshot = timeline.finalize();
+    // Must be classified audible — the AI genuinely was playing when this speech interval began —
+    // even though by confirmation time the turn had already closed.
+    expect(snapshot.confirmedBargeIns[0].context).toBe("audible");
+    expect(snapshot.confirmedBargeIns[0].aiResponseId).toBe("resp_1");
+    expect(snapshot.session.confirmedInterruptionCount).toBe(1);
+    expect(snapshot.aiTurns[0].wasInterrupted).toBe(true);
+  });
+
+  it("still classifies pre_playback correctly when the AI truly was never playing at speech-start time", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1"); // created, but never starts playing
+    clock.advance(80);
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+    timeline.recordResponseDone("resp_1", "cancelled");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.confirmedBargeIns[0].context).toBe("pre_playback");
+    expect(snapshot.session.confirmedInterruptionCount).toBe(0);
+    expect(snapshot.session.technicalBargeInCount).toBe(1);
+  });
+
+  it("records the at-start snapshot on UserTurnMetric.audibleAiResponseIdAtStart, matching the AI turn actually interrupted", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(100);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(500);
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+    clock.advance(20);
+    timeline.recordAiAudioCleared("resp_1");
+    timeline.recordResponseDone("resp_1", "cancelled");
+    clock.advance(300);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Hold on.");
+
+    const snapshot = timeline.finalize();
+    const turn = snapshot.userTurns.find((t) => t.itemId === "item_1")!;
+    expect(turn.audibleAiResponseIdAtStart).toBe("resp_1");
+
+    // A user turn whose speech began with no AI audio playing must record null.
+    expect(snapshot.userTurns.every((t) => t.itemId !== "item_1" || t.audibleAiResponseIdAtStart === "resp_1")).toBe(true);
+  });
+
+  it("produces a plausible positive overlap for a genuine mid-playback interruption, reproducing the production control-test scenario end to end", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(100);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(2000); // AI has been audibly speaking for 2s
+    timeline.recordUserSpeechStarted("item_1"); // user starts speaking over it
+    clock.advance(250); // standard confirmation window
+    timeline.recordConfirmedBargeIn();
+    clock.advance(80); // network round trip for cancel+clear to take effect
+    timeline.recordAiAudioCleared("resp_1");
+    timeline.recordResponseDone("resp_1", "cancelled");
+    clock.advance(400);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Actually, let me stop you there.");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.session.confirmedInterruptionCount).toBe(1);
+    expect(snapshot.overlaps).toHaveLength(1);
+    // Overlap spans from when the user started to when the AI's audio actually stopped — at least
+    // the confirmation window's worth of genuinely simultaneous speech, never a near-zero sliver.
+    expect(snapshot.overlaps[0].durationMs).toBeGreaterThan(250);
+    expect(snapshot.session.totalOverlapMs).toBeGreaterThan(250);
+  });
+
+  it("verifies overlap never mixes the server audio clock with the client clock (both startMs/endMs are client-clock only)", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    // Server audio_start_ms/audio_end_ms deliberately set to values wildly different from the
+    // client elapsed() clock, to prove overlap computation is unaffected by them.
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(100);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(1000);
+    timeline.recordUserSpeechStarted("item_1", 999999); // server clock: totally different origin
+    clock.advance(300);
+    timeline.recordAiAudioStopped("resp_1");
+    timeline.recordResponseDone("resp_1", "completed");
+    clock.advance(200);
+    timeline.recordUserSpeechStopped("item_1", 1000500); // server duration would be 501ms
+    timeline.recordUserTranscript("item_1", "I have a question.");
+
+    const snapshot = timeline.finalize();
+    // durationMs legitimately prefers the server clock (501ms) for this one figure, but the
+    // interval used for overlap (startMs/endMs) must stay entirely on the client clock.
+    const userTurn = snapshot.userTurns[0];
+    expect(userTurn.durationSource).toBe("server_vad");
+    expect(userTurn.durationMs).toBe(501);
+    expect(userTurn.startMs).toBe(1100); // client clock, not anywhere near 999999
+    expect(userTurn.endMs).toBe(1600);
+    expect(snapshot.overlaps).toHaveLength(1);
+    expect(snapshot.overlaps[0].durationMs).toBe(300); // computed entirely from client-clock values
   });
 });

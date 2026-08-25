@@ -15,7 +15,7 @@ import { connectRealtimeSession, type RealtimeConnection } from "@/lib/realtime/
 import { waitForPendingUserTranscription } from "@/lib/realtime/pendingTranscription";
 import { waitForCurrentExchangeToFinish } from "@/lib/realtime/exchangeCompletion";
 import { logFinalizationStage } from "@/lib/realtime/finalizationLog";
-import { createBargeInController, DEFAULT_BARGE_IN_CONFIRM_MS } from "@/lib/realtime/bargeIn";
+import { createBargeInController, DEFAULT_BARGE_IN_CONFIRM_MS, type BargeInController } from "@/lib/realtime/bargeIn";
 import { computeStartupConfirmMs } from "@/lib/realtime/startupGuard";
 import { logRealtimeDebugEvent } from "@/lib/realtime/debugLog";
 import {
@@ -92,6 +92,13 @@ export function RealtimeSimulationClient({
   const sessionMountedAtRef = useRef(Date.now());
   const firstAiAudioStartAtRef = useRef<number | null>(null);
   const micSettingsRef = useRef<MediaTrackSettings | null>(null);
+  /** The bargeIn controller from the most recent connect() attempt — tracked so a reconnect can
+   *  reset() the PREVIOUS instance's pending confirmation timer before abandoning it. A real
+   *  setTimeout does not get cancelled just because its enclosing closure is abandoned: without
+   *  this, a stale timer from a dead connection could still fire later and call onConfirmedBargeIn
+   *  against a since-replaced connection, recording a spurious confirmed-barge-in metric event
+   *  uncorrelated with anything the user actually did. */
+  const bargeInRef = useRef<BargeInController | null>(null);
   /** Objective timing/interruption measurement layer — spans the whole practice session (created
    *  once at mount), not per WebRTC connection attempt, since a reconnect is a technical hiccup,
    *  not a new session from the user's or the metrics' point of view. See sessionTimeline.ts. */
@@ -219,6 +226,9 @@ export function RealtimeSimulationClient({
     // applies again, not just on the very first connection attempt of the session.
     isFirstAiResponseRef.current = true;
     firstAiAudioStartAtRef.current = null;
+    // Cancel any still-pending confirmation timer from a previous, now-abandoned connection attempt
+    // before creating a new bargeIn controller for this one — see bargeInRef's own doc comment.
+    bargeInRef.current?.reset();
 
     try {
       const { clientSecret, openingLine } = await postJson<{ clientSecret: string; openingLine: string }>(
@@ -258,6 +268,7 @@ export function RealtimeSimulationClient({
           dispatch({ type: "USER_STOPPED_SPEAKING" });
         },
       });
+      bargeInRef.current = bargeIn;
 
       const connection = await connectRealtimeSession(clientSecret, {
         onRemoteTrack: (stream) => {
@@ -493,6 +504,7 @@ export function RealtimeSimulationClient({
     return () => {
       connectionRef.current?.close();
       connectionRef.current = null;
+      bargeInRef.current?.reset();
       // This component unmounts when navigation away actually lands — logging here (rather than
       // right after router.push) is what tells us navigation genuinely completed, as opposed to
       // silently stalling with the old page still mounted (see navigationStalled below).

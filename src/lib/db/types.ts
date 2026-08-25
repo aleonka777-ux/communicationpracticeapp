@@ -217,6 +217,13 @@ export interface RealtimeTurnEventRow {
    *  src/lib/realtime/sessionTimeline.ts's doc comment on idempotent audible interruption. Null for
    *  every other kind. */
   counts_toward_interruption: boolean | null;
+  /** user_turn rows only. The OpenAI Realtime response id that was actively playing audio at the
+   *  instant this speech interval began — snapshotted then, never re-derived later. External API
+   *  id, not a foreign key, matching realtime_response_id's own convention. Null if the AI was not
+   *  audibly playing when this turn started, or for every non-user_turn kind. See
+   *  src/lib/realtime/sessionTimeline.ts's doc comment on classifying audible-vs-pre_playback at
+   *  speech-start time. */
+  audible_ai_response_id_at_start: string | null;
   metadata: Record<string, unknown>;
   created_at: string;
 }

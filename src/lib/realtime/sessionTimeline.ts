@@ -91,6 +91,33 @@
  * does not assume a transcript proves genuine speech either way — the dedup key is the interrupted
  * AI response, not anything transcript-derived.
  *
+ * Classifying audible-vs-pre_playback at speech-START time, not confirmation time: a candidate
+ * interruption spans from `input_audio_buffer.speech_started` to the confirmation firing, 250ms
+ * later by default — up to ~1.5s during the startup-guard window (see startupGuard.ts). Whether the
+ * AI was audibly speaking is a fact about the moment the user's speech interval BEGAN, not a fact
+ * to be re-derived from whatever shared mutable state (`currentAiResponseId`/`pendingResponseId`)
+ * happens to read at confirmation time — by then the AI's turn may have naturally concluded, been
+ * closed for an unrelated reason, or (in a reconnect edge case) a completely different response may
+ * be in flight. Re-reading live state at confirmation time would silently misclassify a genuine
+ * mid-playback interruption as `"pre_playback"` (or leave it unattributed) purely because time
+ * passed between the two moments. `recordUserSpeechStarted()` therefore snapshots
+ * `currentAiResponseId`/`pendingResponseId` onto the user turn itself, at the instant speech starts;
+ * `recordConfirmedBargeIn()` reads that snapshot (via whichever user turn is currently open) rather
+ * than re-deriving the answer from present-tense state. The snapshotted, at-start audible response
+ * id is also what gets marked `wasInterrupted` on the AI turn side, and what overlap/latency
+ * ultimately reconcile against, so every derived signal agrees on the same moment-in-time answer.
+ *
+ * A related, separate correctness note: overlap and response latency intentionally use ONLY the
+ * client monotonic clock end to end (`UserTurnMetric.startMs`/`endMs`, `AiTurnMetric.startMs`/
+ * `endMs`) — never the server's separate `audio_start_ms`/`audio_end_ms` clock, which has no
+ * established offset relative to the client clock (see the AI turn boundaries note above). Mixing
+ * the two domains in an interval intersection would produce a meaningless result — including,
+ * coincidentally, a near-zero "overlap" if the two clocks happen to be offset by roughly the size of
+ * the true overlap. This has been re-verified: `startMs`/`endMs` on both metric types are always
+ * `elapsed()`-derived; only `durationMs` for a `server_vad`-timed user turn additionally prefers the
+ * server clock for that one figure specifically (see the AI/user turn boundaries note above) and is
+ * never used in the overlap/latency interval math itself.
+ *
  * User-speech-event classification: a raw `speech_started` -> `speech_stopped` pair is NOT by
  * itself evidence that a real user communication turn occurred — production testing has confirmed
  * false `speech_started` events from speaker echo. Every such event is classified as either
@@ -134,6 +161,11 @@ export interface UserTurnMetric {
   serverAudioEndMs: number | null;
   transcript: string | null;
   transcriptionFailed: boolean;
+  /** The AI response id that was actively playing audio at the instant THIS speech interval began
+   *  — captured then, never re-derived later. Null if the AI was not audibly playing at that
+   *  moment (though a response may still have been pending — see the module doc comment on
+   *  classifying audible-vs-pre_playback at speech-start time). */
+  audibleAiResponseIdAtStart: string | null;
 }
 
 export interface AiTurnMetric {
@@ -243,6 +275,10 @@ interface MutableUserTurn {
   /** Set retrospectively by recordConfirmedBargeIn() if this was the open user turn at the moment
    *  of confirmation — see the classification doc comment above (rule 1). */
   triggeredConfirmedBargeIn: boolean;
+  /** Snapshotted at recordUserSpeechStarted() time — see the module doc comment on classifying
+   *  audible-vs-pre_playback at speech-start time, not confirmation time. */
+  audibleAiResponseIdAtStart: string | null;
+  pendingAiResponseIdAtStart: string | null;
 }
 
 interface MutableAiTurn {
@@ -422,6 +458,10 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
         transcript: null,
         transcriptionFailed: false,
         triggeredConfirmedBargeIn: false,
+        // Snapshotted NOW, not re-derived later — see the module doc comment on classifying
+        // audible-vs-pre_playback at speech-start time.
+        audibleAiResponseIdAtStart: currentAiResponseId,
+        pendingAiResponseIdAtStart: pendingResponseId,
       });
       userTurnOrder.push(itemId);
       currentOpenUserItemId = itemId;
@@ -492,14 +532,21 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
     },
 
     recordConfirmedBargeIn() {
-      // Prefer the response actively producing audio; if none is playing yet, fall back to one
-      // that has been created but hasn't started playing — see the module doc comment on the
-      // response.created -> output_audio_buffer.started gap. This is attribution only: no
-      // AiTurnMetric is fabricated for a response that never produced audio.
-      const interruptedResponseId = currentAiResponseId ?? pendingResponseId;
-      // "audible" iff AI audio was actually playing (currentAiResponseId set); otherwise this is a
-      // pre-playback cancellation — a real technical barge-in, but not an audible interruption.
-      const context: BargeInContext = currentAiResponseId ? "audible" : "pre_playback";
+      // A confirmed barge-in can only ever fire while the triggering user turn is still open (see
+      // bargeIn.ts — a blip that stops before confirmation never reaches this callback), so
+      // whichever user turn is currently open is unambiguously the one that earned it.
+      const userTurn = currentOpenUserItemId ? userTurnsByItemId.get(currentOpenUserItemId) : null;
+
+      // Use the AI state SNAPSHOTTED when this user turn's speech started, not live state read now
+      // — see the module doc comment on classifying audible-vs-pre_playback at speech-start time.
+      // The `userTurn` guard is a defensive fallback only (the invariant above should always hold);
+      // falling back to live state here is strictly no worse than the pre-fix behavior.
+      const audibleResponseId = userTurn ? userTurn.audibleAiResponseIdAtStart : currentAiResponseId;
+      const pendingResponseIdAtStart = userTurn ? userTurn.pendingAiResponseIdAtStart : pendingResponseId;
+      const interruptedResponseId = audibleResponseId ?? pendingResponseIdAtStart;
+      // "audible" iff AI audio was actually playing WHEN THIS SPEECH INTERVAL BEGAN; otherwise this
+      // is a pre-playback cancellation — a real technical barge-in, but not an audible interruption.
+      const context: BargeInContext = audibleResponseId !== null ? "audible" : "pre_playback";
       // Idempotent per AI response — see the module doc comment on idempotent audible interruption.
       const countsTowardInterruption =
         context === "audible" && interruptedResponseId !== null && !audibleInterruptedResponseIds.has(interruptedResponseId);
@@ -507,12 +554,10 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
         audibleInterruptedResponseIds.add(interruptedResponseId);
       }
       confirmedBargeIns.push({ atMs: elapsed(), aiResponseId: interruptedResponseId, context, countsTowardInterruption });
-      const aiTurn = currentAiResponseId ? aiTurnsByResponseId.get(currentAiResponseId) : null;
+      // Mark the interval that was ACTUALLY audible when the interruption began — consistent with
+      // the attribution above, not whatever AI turn happens to be "current" now.
+      const aiTurn = audibleResponseId ? aiTurnsByResponseId.get(audibleResponseId) : null;
       if (aiTurn) aiTurn.wasInterrupted = true;
-      // A confirmed barge-in can only ever fire while the triggering user turn is still open (see
-      // bargeIn.ts — a blip that stops before confirmation never reaches this callback), so
-      // whichever user turn is currently open is unambiguously the one that earned it.
-      const userTurn = currentOpenUserItemId ? userTurnsByItemId.get(currentOpenUserItemId) : null;
       if (userTurn) userTurn.triggeredConfirmedBargeIn = true;
     },
 
@@ -556,6 +601,7 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
           serverAudioEndMs: t.serverAudioEndMs,
           transcript: t.transcript,
           transcriptionFailed: t.transcriptionFailed,
+          audibleAiResponseIdAtStart: t.audibleAiResponseIdAtStart,
         };
       });
       // Everything below derives session-level facts from CONFIRMED user turns only — a

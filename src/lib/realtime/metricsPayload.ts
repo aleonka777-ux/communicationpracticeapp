@@ -33,6 +33,10 @@ const userTurnSchema = z.object({
   serverAudioEndMs: z.number().nullable(),
   transcript: z.string().nullable(),
   transcriptionFailed: z.boolean(),
+  // Snapshotted at speech-start time, not re-derived later — see
+  // src/lib/realtime/sessionTimeline.ts's doc comment on classifying audible-vs-pre_playback at
+  // speech-start time.
+  audibleAiResponseIdAtStart: z.string().nullable(),
 });
 
 const aiTurnSchema = z.object({
@@ -130,6 +134,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         transcription_failed: t.transcriptionFailed,
         barge_in_context: null,
         counts_toward_interruption: null,
+        audible_ai_response_id_at_start: t.audibleAiResponseIdAtStart,
         metadata: {},
       }),
     ),
@@ -153,6 +158,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         transcription_failed: null,
         barge_in_context: null,
         counts_toward_interruption: null,
+        audible_ai_response_id_at_start: null,
         metadata: {},
       }),
     ),
@@ -176,6 +182,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         transcription_failed: null,
         barge_in_context: null,
         counts_toward_interruption: null,
+        audible_ai_response_id_at_start: null,
         metadata: {},
       }),
     ),
@@ -199,6 +206,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         transcription_failed: null,
         barge_in_context: b.context,
         counts_toward_interruption: b.countsTowardInterruption,
+        audible_ai_response_id_at_start: null,
         metadata: {},
       }),
     ),
