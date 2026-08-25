@@ -18,6 +18,12 @@ import { logFinalizationStage } from "@/lib/realtime/finalizationLog";
 import { createBargeInController, DEFAULT_BARGE_IN_CONFIRM_MS } from "@/lib/realtime/bargeIn";
 import { computeStartupConfirmMs } from "@/lib/realtime/startupGuard";
 import { logRealtimeDebugEvent } from "@/lib/realtime/debugLog";
+import {
+  createSessionTimeline,
+  formatSessionTimelineDebugLines,
+  type AiResponseStatus,
+  type SessionTimeline,
+} from "@/lib/realtime/sessionTimeline";
 
 const NAVIGATION_STALL_TIMEOUT_MS = 8000;
 
@@ -86,6 +92,10 @@ export function RealtimeSimulationClient({
   const sessionMountedAtRef = useRef(Date.now());
   const firstAiAudioStartAtRef = useRef<number | null>(null);
   const micSettingsRef = useRef<MediaTrackSettings | null>(null);
+  /** Objective timing/interruption measurement layer — spans the whole practice session (created
+   *  once at mount), not per WebRTC connection attempt, since a reconnect is a technical hiccup,
+   *  not a new session from the user's or the metrics' point of view. See sessionTimeline.ts. */
+  const metricsRef = useRef<SessionTimeline | null>(null);
 
   useEffect(() => {
     stateRef.current = state;
@@ -122,6 +132,7 @@ export function RealtimeSimulationClient({
           // than waiting for it, unlike ordinary timer expiry (see waitForCurrentExchangeToFinish).
           dispatch({ type: "END_PRACTICE" });
           connectionRef.current?.sendEvent({ type: "response.cancel" });
+          metricsRef.current?.recordResponseCancelled(null, "manual_end_practice");
         } else {
           // 0:00 means finish after the current exchange, not cut it off mid-word: let the user
           // finish speaking and let any resulting AI response play out completely before ending.
@@ -139,6 +150,31 @@ export function RealtimeSimulationClient({
         connectionRef.current?.close();
         connectionRef.current = null;
         logStage("realtime_closed");
+
+        // Finalize and best-effort persist the objective timing/interruption measurement layer.
+        // Deliberately isolated in its own try/catch: a metrics failure must never block or affect
+        // the transcript flush / /api/practice/end call below (see /docs/DECISIONS.md).
+        try {
+          const snapshot = metricsRef.current?.finalize() ?? null;
+          if (snapshot) {
+            for (const line of formatSessionTimelineDebugLines(snapshot)) {
+              console.debug("[voice:realtime:metrics]", line);
+            }
+            await postJson("/api/simulation/realtime/metrics", {
+              sessionId,
+              userTurns: snapshot.userTurns,
+              aiTurns: snapshot.aiTurns,
+              overlaps: snapshot.overlaps,
+              confirmedBargeIns: snapshot.confirmedBargeIns,
+              session: snapshot.session,
+            });
+          }
+        } catch (error) {
+          console.error(
+            "[voice:realtime] failed to persist timing metrics (transcript/evaluation unaffected)",
+            error instanceof Error ? error.message : error,
+          );
+        }
 
         dispatch({ type: "EVALUATION_STARTED" });
 
@@ -207,6 +243,8 @@ export function RealtimeSimulationClient({
           if (aiAudioSpeechIncidentRef.current) aiAudioSpeechIncidentRef.current.wasInterrupted = true;
           connection.sendEvent({ type: "response.cancel" });
           logRealtimeDebugEvent(sessionId, "response_cancelled", { reason: "confirmed_bargein" });
+          metricsRef.current?.recordConfirmedBargeIn();
+          metricsRef.current?.recordResponseCancelled(null, "confirmed_bargein");
           dispatch({ type: "USER_STARTED_SPEAKING" });
         },
         onSpeechStoppedAfterReport: () => {
@@ -265,6 +303,12 @@ export function RealtimeSimulationClient({
                 isFirstAiResponse: isFirst,
                 sessionElapsedMs: Date.now() - sessionMountedAtRef.current,
               });
+              // audio_start_ms is the server's own VAD boundary timestamp — the most precise
+              // signal available for this turn's eventual duration (see sessionTimeline.ts).
+              metricsRef.current?.recordUserSpeechStarted(
+                String(event.item_id ?? ""),
+                typeof event.audio_start_ms === "number" ? event.audio_start_ms : null,
+              );
               if (aiWasSpeaking) {
                 const sinceFirstAiAudioMs = firstAiAudioStartAtRef.current ? Date.now() - firstAiAudioStartAtRef.current : null;
                 aiAudioSpeechIncidentRef.current = {
@@ -296,6 +340,10 @@ export function RealtimeSimulationClient({
                   micSettings: incident.isFirstAiResponse ? micSettingsRef.current : undefined,
                 });
               }
+              metricsRef.current?.recordUserSpeechStopped(
+                String(event.item_id ?? ""),
+                typeof event.audio_end_ms === "number" ? event.audio_end_ms : null,
+              );
               bargeIn.handleSpeechStopped();
               break;
             }
@@ -308,7 +356,10 @@ export function RealtimeSimulationClient({
                 isFirstAiResponse: aiAudioSpeechIncidentRef.current?.isFirstAiResponse ?? false,
               });
               aiAudioSpeechIncidentRef.current = null;
-              if (transcript) void enqueueTranscript("user", transcript);
+              if (transcript) {
+                metricsRef.current?.recordUserTranscript(String(event.item_id ?? ""), transcript);
+                void enqueueTranscript("user", transcript);
+              }
               break;
             }
             case "conversation.item.input_audio_transcription.failed":
@@ -330,14 +381,19 @@ export function RealtimeSimulationClient({
               logRealtimeDebugEvent(sessionId, "ai_response_created", { isFirstAiResponse: isFirstAiResponseRef.current });
               bargeIn.handleAiSpeakingChanged(true);
               break;
-            case "response.done":
+            case "response.done": {
               // Always emitted, regardless of outcome (completed/cancelled/failed) — the reliable
               // backstop for clearing "AI is speaking" even if a response never actually produced
               // any audio at all, so this flag can never get stuck true from response.created above.
               logRealtimeDebugEvent(sessionId, "ai_response_done", { isFirstAiResponse: isFirstAiResponseRef.current });
               bargeIn.handleAiSpeakingChanged(false);
+              const response = event.response as { id?: string; status?: string } | undefined;
+              if (response?.id && response.status) {
+                metricsRef.current?.recordResponseDone(response.id, response.status as AiResponseStatus);
+              }
               break;
-            case "output_audio_buffer.started":
+            }
+            case "output_audio_buffer.started": {
               if (firstAiAudioStartAtRef.current === null) firstAiAudioStartAtRef.current = Date.now();
               logRealtimeDebugEvent(sessionId, "ai_audio_started", {
                 isFirstAiResponse: isFirstAiResponseRef.current,
@@ -345,23 +401,35 @@ export function RealtimeSimulationClient({
               });
               bargeIn.handleAiSpeakingChanged(true);
               dispatch({ type: "AI_STARTED_SPEAKING" });
+              const responseId = event.response_id as string | undefined;
+              if (responseId) metricsRef.current?.recordAiAudioStarted(responseId);
               break;
-            case "output_audio_buffer.stopped":
+            }
+            case "output_audio_buffer.stopped": {
               logRealtimeDebugEvent(sessionId, "ai_audio_completed", { isFirstAiResponse: isFirstAiResponseRef.current });
               bargeIn.handleAiSpeakingChanged(false);
               dispatch({ type: "AI_FINISHED_SPEAKING" });
+              const responseId = event.response_id as string | undefined;
+              if (responseId) metricsRef.current?.recordAiAudioStopped(responseId);
               // The startup-specific protection only ever applies to this one, first AI turn —
               // every turn after it reverts to the normal, shorter confirmation window.
               isFirstAiResponseRef.current = false;
               break;
+            }
             case "response.output_audio_transcript.done": {
+              const transcript = String(event.transcript ?? "").trim();
+              const responseId = event.response_id as string | undefined;
+              // Recorded in the turn metric even for the opening line — a real AI turn with real
+              // timing either way; only the conversation_messages persistence below is skipped for
+              // it (already written at session creation, see src/lib/practice/actions.ts).
+              if (responseId && transcript) metricsRef.current?.recordAiTranscript(responseId, transcript);
+
               // The very first AI turn is the scenario's opening line, already persisted at
-              // session creation (src/lib/practice/actions.ts) — skip it here to avoid a duplicate.
+              // session creation — skip it here to avoid a duplicate.
               if (!openingLineTranscriptSkippedRef.current) {
                 openingLineTranscriptSkippedRef.current = true;
                 break;
               }
-              const transcript = String(event.transcript ?? "").trim();
               if (transcript) void enqueueTranscript("interlocutor", transcript);
               break;
             }
@@ -392,6 +460,7 @@ export function RealtimeSimulationClient({
   }, [sessionId, enqueueTranscript]);
 
   useEffect(() => {
+    metricsRef.current = createSessionTimeline();
     void connect();
     return () => {
       connectionRef.current?.close();

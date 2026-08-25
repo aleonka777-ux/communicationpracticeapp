@@ -162,6 +162,62 @@ export interface EvaluationRow {
   created_at: string;
 }
 
+export type RealtimeTurnEventKind = "user_turn" | "ai_turn" | "overlap" | "confirmed_barge_in";
+export type RealtimeTurnDurationSource = "server_vad" | "client_playback";
+export type RealtimeResponseStatus = "completed" | "cancelled" | "failed" | "incomplete" | "in_progress";
+
+/**
+ * One row per user turn, AI turn, overlap interval, or confirmed barge-in — see
+ * supabase/migrations/0009_realtime_timing_metrics.sql and /docs/DECISIONS.md "Realtime timing
+ * metrics". Never contains raw audio; only timestamps (ms relative to session start), durations,
+ * and small structured metadata.
+ */
+export interface RealtimeTurnEventRow {
+  id: string;
+  session_id: string;
+  kind: RealtimeTurnEventKind;
+  turn_index: number | null;
+  start_ms: number;
+  end_ms: number | null;
+  duration_ms: number | null;
+  duration_source: RealtimeTurnDurationSource | null;
+  server_audio_start_ms: number | null;
+  server_audio_end_ms: number | null;
+  was_interrupted: boolean | null;
+  ended_by_session_close: boolean | null;
+  response_status: RealtimeResponseStatus | null;
+  realtime_item_id: string | null;
+  realtime_response_id: string | null;
+  message_id: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+/** Session-level derived timing/interruption metrics — one row per session, upserted at finalization. */
+export interface RealtimeSessionMetricsRow {
+  id: string;
+  session_id: string;
+  total_duration_ms: number;
+  user_turn_count: number;
+  ai_turn_count: number;
+  total_user_speaking_ms: number;
+  total_ai_speaking_ms: number;
+  user_speaking_percentage: number;
+  ai_speaking_percentage: number;
+  total_overlap_ms: number;
+  overlap_count: number;
+  confirmed_interruption_count: number;
+  avg_user_turn_duration_ms: number | null;
+  longest_user_turn_ms: number | null;
+  avg_ai_turn_duration_ms: number | null;
+  avg_user_response_latency_ms: number | null;
+  median_user_response_latency_ms: number | null;
+  longest_user_response_latency_ms: number | null;
+  avg_ai_response_latency_ms: number | null;
+  median_ai_response_latency_ms: number | null;
+  computed_at: string;
+}
+
 /** Matches the classic @supabase/postgrest-js generated-types shape (Row/Insert/Update per table). */
 type Table<Row, Insert> = { Row: Row; Insert: Insert; Update: Partial<Row> };
 
@@ -174,6 +230,8 @@ export interface Database {
       practice_sessions: Table<PracticeSessionRow, Partial<PracticeSessionRow>>;
       conversation_messages: Table<ConversationMessageRow, Partial<ConversationMessageRow>>;
       evaluations: Table<EvaluationRow, Omit<EvaluationRow, "id" | "created_at">>;
+      realtime_turn_events: Table<RealtimeTurnEventRow, Omit<RealtimeTurnEventRow, "id" | "created_at">>;
+      realtime_session_metrics: Table<RealtimeSessionMetricsRow, Omit<RealtimeSessionMetricsRow, "id" | "computed_at">>;
     };
     Views: Record<string, never>;
     Functions: Record<string, never>;

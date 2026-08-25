@@ -59,6 +59,8 @@ No component calls an AI or voice provider directly. No component holds a provid
 - `practice_sessions` — one row per attempt. Tracks `mode`, `selected_duration_seconds`, `status`, `attempt_number` (computed server-side per user+scenario), `hint_count`, `readiness_rating`.
 - `conversation_messages` — one row per turn (`speaker`: `user | interlocutor | coach_hint`), ordered by `sequence`. Chosen over a single transcript blob so turns can be queried, counted, and fed to prompts incrementally without re-parsing text.
 - `evaluations` — one row per session (1:1). Six scalar scores for simple querying/comparison + `structured_evidence` JSONB holding the evidence/explanation pairs per dimension (matches the AI's structured output shape 1:1, avoids 18 extra columns for something that's always read as a unit).
+- `realtime_turn_events` — one row per user turn, AI turn, overlap interval, or confirmed barge-in captured during a Realtime session (kind-discriminated via `kind`). Structured numeric/boolean/enum columns for every known field; a small `metadata` JSONB only for genuinely unstructured extras. Never contains raw audio — timestamps (ms relative to session start), durations, and transcript text (already stored in `conversation_messages`) only. See §9.3 and `docs/DECISIONS.md` "Realtime timing metrics."
+- `realtime_session_metrics` — one row per session (1:1, upserted at finalization), the derived aggregate timing/interruption metrics (speaking time/percentage, overlap, confirmed-interruption count, response latency). A measurement layer only — not yet read by the Evaluation Engine or shown in production UI.
 
 Full column lists are in the migration files (`supabase/migrations`) — they are the source of truth; this document describes intent, not a mirror of the DDL.
 
@@ -66,7 +68,7 @@ Full column lists are in the migration files (`supabase/migrations`) — they ar
 
 - `profiles`: user selects/updates own row only. No self-service role escalation (role changes go through a server action gated on the *current* profile already being `coach`).
 - `communication_tools`, `scenarios`: `SELECT` where `active = true` for any authenticated user; coaches can additionally see inactive rows and `INSERT`/`UPDATE`/`DELETE`.
-- `practice_sessions`, `conversation_messages`, `evaluations`: owner-only (`user_id = auth.uid()`, messages/evaluations via a subquery on the parent session's `user_id`). No cross-user visibility, including for coaches — coaches manage methodology, not other users' transcripts, in this MVP.
+- `practice_sessions`, `conversation_messages`, `evaluations`, `realtime_turn_events`, `realtime_session_metrics`: owner-only (`user_id = auth.uid()`, the latter four via a subquery on the parent session's `user_id`). No cross-user visibility, including for coaches — coaches manage methodology, not other users' transcripts, in this MVP.
 
 ## 5. Authentication
 
@@ -134,6 +136,13 @@ Two parallel implementations exist, selected per-session by `REALTIME_VOICE_ENAB
 - Transcript persistence is the one place the server is still involved mid-conversation: as the data channel emits `conversation.item.input_audio_transcription.completed` (user) and `response.output_audio_transcript.done` (AI) events, the client POSTs each completed turn to `/api/simulation/realtime/transcript`, which calls the same `appendMessage()` used by the batch flow — so `conversation_messages` looks identical regardless of transport, and the post-session Evaluation Engine (`src/lib/coaching/*`, invoked via `/api/practice/end`) needs no changes at all.
 - Timer and End Practice are identical in behavior to the batch screen (same `computeRemainingSeconds` utility, same `/api/practice/end` call on timeout or manual end) — only the transport and the mid-conversation UI differ.
 - Typed input remains available as a secondary fallback *within* an active Realtime session (sent as a `conversation.item.create` + `response.create` pair over the data channel, and persisted the same way as spoken turns) — separate from the deployment-level rollback to the batch component entirely.
+
+### 9.3 Timing + interruption metrics (measurement layer)
+
+- `src/lib/realtime/sessionTimeline.ts` (pure, injectable-clock module) listens to the same Realtime data-channel events as §9.2's transcript persistence, plus `input_audio_buffer.speech_started`/`.speech_stopped`, `output_audio_buffer.started`/`.stopped`, `response.created`/`response.done`, and the existing barge-in controller's confirmed-interruption callback — never raw single VAD events. It derives per-turn timing (preferring server-authoritative `audio_start_ms`/`audio_end_ms` for user turns) and, at session end, session-level aggregates (speaking time/percentage, overlap, confirmed-interruption count, user/system response latency).
+- `metricsRef` in `realtime-simulation-client.tsx` is created once per practice session (spanning any WebRTC reconnect, unlike the per-connection barge-in controller) and finalized in `finishAndEvaluate`, which best-effort `POST`s the snapshot to `/api/simulation/realtime/metrics` and logs a human-readable debug view via `console.debug` — a dev/QA aid only, no production UI. A metrics failure is caught, logged, and never blocks the transcript flush or `/api/practice/end`.
+- Persisted via `src/lib/db/realtimeMetrics.ts` into `realtime_turn_events`/`realtime_session_metrics` (see §4.1) — a delete-then-reinsert for turn events and an upsert-by-`session_id` for the aggregate row, so a retried finalization can never double-count. No raw audio is ever stored; see `docs/DECISIONS.md` "Realtime timing metrics" for the full event-source audit.
+- Not yet used by the Evaluation Engine or surfaced to users — `VOCAL_EVIDENCE_AVAILABLE` (§ coaching) is unaffected and stays `false`.
 
 ## 10. State management
 
