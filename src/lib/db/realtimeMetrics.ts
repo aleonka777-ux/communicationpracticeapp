@@ -1,8 +1,22 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { PostgrestError, SupabaseClient } from "@supabase/supabase-js";
 import type { Database, RealtimeSessionMetricsRow, RealtimeTurnEventRow } from "@/lib/db/types";
 
 export type RealtimeTurnEventInput = Omit<RealtimeTurnEventRow, "id" | "session_id" | "created_at">;
 export type RealtimeSessionMetricsInput = Omit<RealtimeSessionMetricsRow, "id" | "session_id" | "computed_at">;
+
+/**
+ * Postgres reports a type-mismatch error (e.g. 22P02, "invalid input syntax for type integer")
+ * with the offending VALUE but never the column name, so a bare error.message alone isn't enough
+ * to find the culprit column in a many-column table. Logging the full row payload alongside it
+ * (never transcript text — this table has none, see RealtimeTurnEventRow) lets a future
+ * schema/type mismatch be diagnosed directly from logs instead of by guesswork.
+ */
+function logPersistenceFailure(context: string, sessionId: string, error: PostgrestError, rows?: unknown): void {
+  console.error(
+    `[realtime-metrics] ${context} failed (transcript/evaluation unaffected)`,
+    JSON.stringify({ sessionId, code: error.code, message: error.message, details: error.details, hint: error.hint, rows }),
+  );
+}
 
 /**
  * Replaces all turn events for a session in one delete-then-insert pass, so finalization stays
@@ -15,14 +29,19 @@ export async function saveRealtimeTurnEvents(
   events: RealtimeTurnEventInput[],
 ): Promise<void> {
   const { error: deleteError } = await supabase.from("realtime_turn_events").delete().eq("session_id", sessionId);
-  if (deleteError) throw deleteError;
+  if (deleteError) {
+    logPersistenceFailure("realtime_turn_events delete", sessionId, deleteError);
+    throw deleteError;
+  }
 
   if (events.length === 0) return;
 
-  const { error: insertError } = await supabase
-    .from("realtime_turn_events")
-    .insert(events.map((event) => ({ ...event, session_id: sessionId })));
-  if (insertError) throw insertError;
+  const rows = events.map((event) => ({ ...event, session_id: sessionId }));
+  const { error: insertError } = await supabase.from("realtime_turn_events").insert(rows);
+  if (insertError) {
+    logPersistenceFailure("realtime_turn_events insert", sessionId, insertError, rows);
+    throw insertError;
+  }
 }
 
 /** Upserts the one session-level metrics row by session_id, so a retried finalization stays idempotent. */
@@ -36,7 +55,10 @@ export async function upsertRealtimeSessionMetrics(
     .upsert({ ...metrics, session_id: sessionId }, { onConflict: "session_id" })
     .select("*")
     .single();
-  if (error) throw error;
+  if (error) {
+    logPersistenceFailure("realtime_session_metrics upsert", sessionId, error, metrics);
+    throw error;
+  }
   return data;
 }
 

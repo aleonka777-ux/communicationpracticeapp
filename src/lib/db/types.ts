@@ -183,11 +183,17 @@ export interface RealtimeTurnEventRow {
   id: string;
   session_id: string;
   kind: RealtimeTurnEventKind;
+  /** Always a whole number (array position) — the one genuinely integer field among these. */
   turn_index: number | null;
+  /**
+   * double precision in Postgres (see migration 0010) — derived from the client's monotonic clock
+   * (performance.now()), which is inherently fractional. Do not assume/round to a whole number.
+   */
   start_ms: number;
   end_ms: number | null;
   duration_ms: number | null;
   duration_source: RealtimeTurnDurationSource | null;
+  /** double precision — see migration 0010; not guaranteed to be a whole millisecond by the SDK. */
   server_audio_start_ms: number | null;
   server_audio_end_ms: number | null;
   was_interrupted: boolean | null;
@@ -202,7 +208,12 @@ export interface RealtimeTurnEventRow {
   created_at: string;
 }
 
-/** Session-level derived timing/interruption metrics — one row per session, upserted at finalization. */
+/**
+ * Session-level derived timing/interruption metrics — one row per session, upserted at
+ * finalization. Every *_ms field is double precision in Postgres (see migration 0010) — all are
+ * derived from the client's monotonic clock or arithmetic (sums/averages/medians) over it, and are
+ * inherently fractional. Only the *_count fields (and user/ai_turn_count) are genuine integers.
+ */
 export interface RealtimeSessionMetricsRow {
   id: string;
   session_id: string;
