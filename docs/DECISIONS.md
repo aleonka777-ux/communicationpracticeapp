@@ -2,6 +2,22 @@
 
 Significant technical decisions and the reasoning behind them. Newest at the top.
 
+## Realtime timing metrics: technical confirmed barge-in vs. audible user interruption
+
+The attribution fix above (previous entry) surfaced a real product-semantics gap: a confirmed barge-in that lands in the `response.created` → `output_audio_buffer.started` gap is a genuine control-plane event (the barge-in controller cancelled a response), but the user never actually spoke over anything they could hear — there was no audio yet. Folding that into the same "confirmed interruption" count as a real, audible interruption would make the metric unusable as a coaching signal (it would count "the user started talking again slightly before the AI's reply had audibly begun" the same as "the user cut the AI off mid-sentence").
+
+**Two concepts, now explicit:**
+1. **Technical confirmed barge-in** — any `onConfirmedBargeIn` callback, i.e. any time the barge-in controller confirmed and cancelled a pending or active AI response. Every one is recorded, always, for debugging/session-control visibility.
+2. **Audible user interruption** — a technical confirmed barge-in where AI audio was *actually playing* at the moment of confirmation. This, not the raw technical count, is the coaching-relevant metric.
+
+**Implementation** (`src/lib/realtime/sessionTimeline.ts`): `ConfirmedBargeInMetric` gained `context: "audible" | "pre_playback"`, computed in `recordConfirmedBargeIn()` as `currentAiResponseId ? "audible" : "pre_playback"` — i.e. exactly the same signal already used to decide attribution (`currentAiResponseId` vs. the `pendingResponseId` fallback), just also captured as an explicit, queryable field rather than left implicit. `SessionLevelMetrics.confirmedInterruptionCount` (the existing, coaching-facing field — kept, not renamed, to avoid unnecessary churn) now counts `context: "audible"` entries only. A new `SessionLevelMetrics.technicalBargeInCount` holds the raw total (audible + pre_playback) for diagnostics. Overlap is untouched by this change — it was already, and remains, purely the intersection of a confirmed user-speech interval and an actual AI-playback interval, independent of barge-in context; a pre-playback cancellation correctly contributes zero overlap, same as before, now just correctly excluded from the coaching count too.
+
+**Schema**: new additive migration `0011_barge_in_context.sql` — `realtime_turn_events` gains `barge_in_context` (nullable, checked `'audible'`/`'pre_playback'`, only ever set on `confirmed_barge_in` kind rows), `realtime_session_metrics` gains `technical_barge_in_count`. `confirmed_interruption_count`'s column comment is updated to state its (corrected) audible-only semantics explicitly. No table drop/recreate, no RLS/constraint changes, no existing data touched.
+
+Still no phantom `AiTurnMetric` is fabricated for a response that never produced audio (unchanged from the previous fix) — a "turn" continues to mean a period of actual playback.
+
+**Tests added** (`tests/unit/sessionTimeline.test.ts`): user starts during actual AI playback → audible interruption = 1; user starts after `response.created` but before playback → technical barge-in = 1, audible interruption = 0, no phantom AI turn; overlap stays 0 for the pre-playback case; and a mixed scenario (one pre-playback + one audible barge-in) confirming `technicalBargeInCount = 2`, `confirmedInterruptionCount = 1`, and that overlap is attributed only to the genuinely audible one — no double-counting in either direction.
+
 ## Realtime timing metrics: confirmed barge-in with zero overlap — attribution gap, not a calculation bug
 
 Production reported a session with `confirmed_interruption_count = 1` but `overlap_count = 0` / `total_overlap_ms = 0`, despite the user intentionally interrupting the AI.

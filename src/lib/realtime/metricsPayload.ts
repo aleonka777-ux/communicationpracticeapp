@@ -16,6 +16,7 @@ import type { RealtimeSessionMetricsInput, RealtimeTurnEventInput } from "@/lib/
 const durationSourceSchema = z.enum(["server_vad", "client_playback"]);
 const responseStatusSchema = z.enum(["completed", "cancelled", "failed", "incomplete", "in_progress"]);
 const userSpeechClassificationSchema = z.enum(["confirmed", "suspected_noise"]);
+const bargeInContextSchema = z.enum(["audible", "pre_playback"]);
 
 const userTurnSchema = z.object({
   // null for a suspected_noise event — it isn't part of the numbered conversation. See
@@ -57,6 +58,10 @@ const overlapSchema = z.object({
 const confirmedBargeInSchema = z.object({
   atMs: z.number(),
   aiResponseId: z.string().nullable(),
+  // "audible": AI audio was actually playing. "pre_playback": a real technical barge-in that
+  // cancelled a response before it ever produced audio — not an audible interruption. See
+  // src/lib/realtime/sessionTimeline.ts's doc comment.
+  context: bargeInContextSchema,
 });
 
 const sessionMetricsSchema = z.object({
@@ -69,7 +74,10 @@ const sessionMetricsSchema = z.object({
   aiSpeakingPercentage: z.number(),
   totalOverlapMs: z.number(),
   overlapCount: z.number().int().nonnegative(),
+  // Coaching-facing: audible interruptions only (context: "audible").
   confirmedInterruptionCount: z.number().int().nonnegative(),
+  // Diagnostic total: every confirmed barge-in regardless of context.
+  technicalBargeInCount: z.number().int().nonnegative(),
   suspectedNoiseEventCount: z.number().int().nonnegative(),
   avgUserTurnDurationMs: z.number().nullable(),
   longestUserTurnMs: z.number().nullable(),
@@ -117,6 +125,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         message_id: null,
         user_turn_classification: t.classification,
         transcription_failed: t.transcriptionFailed,
+        barge_in_context: null,
         metadata: {},
       }),
     ),
@@ -138,6 +147,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         message_id: null,
         user_turn_classification: null,
         transcription_failed: null,
+        barge_in_context: null,
         metadata: {},
       }),
     ),
@@ -159,6 +169,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         message_id: null,
         user_turn_classification: null,
         transcription_failed: null,
+        barge_in_context: null,
         metadata: {},
       }),
     ),
@@ -180,6 +191,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         message_id: null,
         user_turn_classification: null,
         transcription_failed: null,
+        barge_in_context: b.context,
         metadata: {},
       }),
     ),
@@ -199,6 +211,7 @@ export function mapMetricsPayloadToSessionMetrics(body: MetricsPayload): Realtim
     total_overlap_ms: body.session.totalOverlapMs,
     overlap_count: body.session.overlapCount,
     confirmed_interruption_count: body.session.confirmedInterruptionCount,
+    technical_barge_in_count: body.session.technicalBargeInCount,
     suspected_noise_event_count: body.session.suspectedNoiseEventCount,
     avg_user_turn_duration_ms: body.session.avgUserTurnDurationMs,
     longest_user_turn_ms: body.session.longestUserTurnMs,

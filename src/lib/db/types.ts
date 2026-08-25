@@ -172,6 +172,13 @@ export type RealtimeResponseStatus = "completed" | "cancelled" | "failed" | "inc
  * doc comment for the exact rule. Null for every other event kind.
  */
 export type RealtimeUserTurnClassification = "confirmed" | "suspected_noise";
+/**
+ * confirmed_barge_in rows only. "audible": AI audio was actually playing when the barge-in
+ * confirmed — the coaching-relevant case. "pre_playback": the response had been created but had
+ * not yet produced any audio — a real technical barge-in/cancellation, but not an audible
+ * interruption. See src/lib/realtime/sessionTimeline.ts's doc comment. Null for every other kind.
+ */
+export type RealtimeBargeInContext = "audible" | "pre_playback";
 
 /**
  * One row per user turn, AI turn, overlap interval, or confirmed barge-in — see
@@ -204,6 +211,7 @@ export interface RealtimeTurnEventRow {
   message_id: string | null;
   user_turn_classification: RealtimeUserTurnClassification | null;
   transcription_failed: boolean | null;
+  barge_in_context: RealtimeBargeInContext | null;
   metadata: Record<string, unknown>;
   created_at: string;
 }
@@ -226,7 +234,10 @@ export interface RealtimeSessionMetricsRow {
   ai_speaking_percentage: number;
   total_overlap_ms: number;
   overlap_count: number;
+  /** Coaching-facing: audible interruptions only (context "audible"). See RealtimeBargeInContext. */
   confirmed_interruption_count: number;
+  /** Diagnostic total: every confirmed barge-in regardless of context (audible + pre_playback). */
+  technical_barge_in_count: number;
   suspected_noise_event_count: number;
   avg_user_turn_duration_ms: number | null;
   longest_user_turn_ms: number | null;

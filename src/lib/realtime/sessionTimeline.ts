@@ -43,6 +43,19 @@
  * specifically means a period of actual playback (creating one would misrepresent AI speaking time
  * with a phantom zero-duration turn).
  *
+ * Technical confirmed barge-in vs. audible user interruption: these are deliberately two different
+ * concepts, not two names for the same thing. Every `onConfirmedBargeIn` callback is a real
+ * transport/control event — the barge-in controller decided to cancel a pending or active AI
+ * response — and is always recorded as a `ConfirmedBargeInMetric` for debugging/session-control
+ * visibility (`SessionLevelMetrics.technicalBargeInCount`). But per the gap described above, that
+ * cancellation can land BEFORE the response ever produced any audio (`context: "pre_playback"`),
+ * in which case the user did not actually speak over anything they could hear — it is not a
+ * coaching-relevant interruption. Only a barge-in confirmed while AI audio was actually playing
+ * (`context: "audible"`) counts toward `SessionLevelMetrics.confirmedInterruptionCount`, the
+ * coaching-facing interruption metric. Overlap remains independent of both: it is always the
+ * objective intersection of a confirmed user-speech interval and an actual AI-playback interval,
+ * regardless of which barge-in context (if any) accompanied it.
+ *
  * User-speech-event classification: a raw `speech_started` -> `speech_stopped` pair is NOT by
  * itself evidence that a real user communication turn occurred — production testing has confirmed
  * false `speech_started` events from speaker echo. Every such event is classified as either
@@ -112,9 +125,18 @@ export interface OverlapIntervalMetric {
   aiResponseId: string;
 }
 
+/**
+ * "audible": AI audio was actually playing when the barge-in confirmed — the user spoke over
+ * something they could hear; this is the coaching-relevant case.
+ * "pre_playback": the response had been created but had not yet produced any audio — a real
+ * transport/control cancellation, but not an audible interruption. See the module doc comment.
+ */
+export type BargeInContext = "audible" | "pre_playback";
+
 export interface ConfirmedBargeInMetric {
   atMs: number;
   aiResponseId: string | null;
+  context: BargeInContext;
 }
 
 export interface ResponseCancelledMetric {
@@ -133,7 +155,12 @@ export interface SessionLevelMetrics {
   aiSpeakingPercentage: number;
   totalOverlapMs: number;
   overlapCount: number;
+  /** Coaching-facing interruption count: confirmed barge-ins with context "audible" ONLY — the
+   *  user spoke over AI audio that was actually playing. See the module doc comment. */
   confirmedInterruptionCount: number;
+  /** ALL confirmed barge-ins regardless of context (audible + pre_playback) — technical/diagnostic
+   *  total, for debugging and session control. Always >= confirmedInterruptionCount. */
+  technicalBargeInCount: number;
   /** Raw speech_started/speech_stopped pairs classified suspected_noise and excluded from every
    *  metric above — see the module doc comment. Diagnostic visibility only. */
   suspectedNoiseEventCount: number;
@@ -343,7 +370,10 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
       // response.created -> output_audio_buffer.started gap. This is attribution only: no
       // AiTurnMetric is fabricated for a response that never produced audio.
       const interruptedResponseId = currentAiResponseId ?? pendingResponseId;
-      confirmedBargeIns.push({ atMs: elapsed(), aiResponseId: interruptedResponseId });
+      // "audible" iff AI audio was actually playing (currentAiResponseId set); otherwise this is a
+      // pre-playback cancellation — a real technical barge-in, but not an audible interruption.
+      const context: BargeInContext = currentAiResponseId ? "audible" : "pre_playback";
+      confirmedBargeIns.push({ atMs: elapsed(), aiResponseId: interruptedResponseId, context });
       const aiTurn = currentAiResponseId ? aiTurnsByResponseId.get(currentAiResponseId) : null;
       if (aiTurn) aiTurn.wasInterrupted = true;
       // A confirmed barge-in can only ever fire while the triggering user turn is still open (see
@@ -459,6 +489,7 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
       const totalUserSpeakingMs = confirmedUserTurns.reduce((sum, t) => sum + t.durationMs, 0);
       const totalAiSpeakingMs = aiTurns.reduce((sum, t) => sum + t.durationMs, 0);
       const totalOverlapMs = overlaps.reduce((sum, o) => sum + o.durationMs, 0);
+      const audibleBargeIns = confirmedBargeIns.filter((b) => b.context === "audible");
 
       const session: SessionLevelMetrics = {
         totalDurationMs: finalizedAtMs,
@@ -470,7 +501,8 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
         aiSpeakingPercentage: finalizedAtMs > 0 ? (totalAiSpeakingMs / finalizedAtMs) * 100 : 0,
         totalOverlapMs,
         overlapCount: overlaps.length,
-        confirmedInterruptionCount: confirmedBargeIns.length,
+        confirmedInterruptionCount: audibleBargeIns.length,
+        technicalBargeInCount: confirmedBargeIns.length,
         suspectedNoiseEventCount: userTurns.length - confirmedUserTurns.length,
         avgUserTurnDurationMs: average(confirmedUserTurns.map((t) => t.durationMs)),
         longestUserTurnMs: confirmedUserTurns.length > 0 ? Math.max(...confirmedUserTurns.map((t) => t.durationMs)) : null,
@@ -512,7 +544,10 @@ export function formatSessionTimelineDebugLines(snapshot: SessionTimelineSnapsho
   if (snapshot.session.avgUserResponseLatencyMs !== null) {
     lines.push(`User response latency (avg): ${toS(snapshot.session.avgUserResponseLatencyMs)}s`);
   }
-  lines.push(`Confirmed barge-in: ${snapshot.confirmedBargeIns.length > 0 ? `true (${snapshot.confirmedBargeIns.length})` : "false"}`);
+  lines.push(
+    `Audible user interruption (coaching-relevant): ${snapshot.session.confirmedInterruptionCount > 0 ? `true (${snapshot.session.confirmedInterruptionCount})` : "false"}`,
+  );
+  lines.push(`Technical confirmed barge-in (all, incl. pre-playback): ${snapshot.session.technicalBargeInCount}`);
   lines.push(`Overlap: ${snapshot.overlaps.length} interval(s), ${toS(snapshot.session.totalOverlapMs)}s total`);
   lines.push(`Suspected false VAD/noise events excluded: ${snapshot.session.suspectedNoiseEventCount}`);
 

@@ -417,6 +417,7 @@ describe("createSessionTimeline", () => {
       "userItemId",
       "aiResponseId",
       "atMs",
+      "context",
       "reason",
       "totalDurationMs",
       "userTurns",
@@ -434,6 +435,7 @@ describe("createSessionTimeline", () => {
       "totalOverlapMs",
       "overlapCount",
       "confirmedInterruptionCount",
+      "technicalBargeInCount",
       "suspectedNoiseEventCount",
       "avgUserTurnDurationMs",
       "longestUserTurnMs",
@@ -563,8 +565,12 @@ describe("createSessionTimeline — confirmed barge-in in the response.created-t
     const snapshot = timeline.finalize();
 
     // Attribution fixed: the confirmed barge-in points at the response it actually interrupted.
-    expect(snapshot.session.confirmedInterruptionCount).toBe(1);
+    // It is a technical barge-in (session control/diagnostics), but NOT a coaching-relevant
+    // audible interruption — no AI audio was ever playing to talk over.
     expect(snapshot.confirmedBargeIns[0].aiResponseId).toBe("resp_2");
+    expect(snapshot.confirmedBargeIns[0].context).toBe("pre_playback");
+    expect(snapshot.session.technicalBargeInCount).toBe(1);
+    expect(snapshot.session.confirmedInterruptionCount).toBe(0);
 
     // No phantom AiTurnMetric is fabricated for a response that never produced audio — only the
     // one real, completed AI turn exists.
@@ -599,5 +605,125 @@ describe("createSessionTimeline — confirmed barge-in in the response.created-t
 
     const snapshot = timeline.finalize();
     expect(snapshot.confirmedBargeIns[0].aiResponseId).toBe("resp_1");
+  });
+});
+
+/**
+ * Regression coverage for a product-semantics fix: a technical confirmed barge-in (the barge-in
+ * controller cancelled a pending or active response) is NOT the same thing as an audible user
+ * interruption (the user spoke over AI audio they could actually hear). A pre-playback
+ * cancellation — confirmed after response.created but before output_audio_buffer.started — is a
+ * real, useful-for-diagnostics technical event, but must NOT count toward the coaching-facing
+ * interruption metric (session.confirmedInterruptionCount), since there was nothing audible to
+ * interrupt. session.technicalBargeInCount tracks the raw total for debugging/session control.
+ */
+describe("createSessionTimeline — audible interruption vs. technical barge-in", () => {
+  it("user starts during actual AI playback -> audible interruption = 1", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(200);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(500);
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.confirmedBargeIns).toHaveLength(1);
+    expect(snapshot.confirmedBargeIns[0].context).toBe("audible");
+    expect(snapshot.session.confirmedInterruptionCount).toBe(1);
+    expect(snapshot.session.technicalBargeInCount).toBe(1);
+  });
+
+  it("user starts after response.created but before audio playback -> technical barge-in = 1, audible interruption = 0", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(80);
+    timeline.recordUserSpeechStarted("item_1"); // before output_audio_buffer.started ever fires
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+    timeline.recordResponseDone("resp_1", "cancelled"); // resp_1 concludes having never played audio
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.confirmedBargeIns).toHaveLength(1);
+    expect(snapshot.confirmedBargeIns[0].context).toBe("pre_playback");
+    expect(snapshot.confirmedBargeIns[0].aiResponseId).toBe("resp_1");
+    expect(snapshot.session.confirmedInterruptionCount).toBe(0);
+    expect(snapshot.session.technicalBargeInCount).toBe(1);
+    // No phantom AI turn is fabricated for a response that never produced audio.
+    expect(snapshot.aiTurns).toHaveLength(0);
+  });
+
+  it("overlap remains 0 for a pre-playback cancellation", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(80);
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+    clock.advance(500);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Hold on a second.");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.overlaps).toHaveLength(0);
+    expect(snapshot.session.overlapCount).toBe(0);
+    expect(snapshot.session.totalOverlapMs).toBe(0);
+  });
+
+  it("does not double-count across a mix of one audible and one pre-playback barge-in", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    // Pre-playback barge-in against resp_1.
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(80);
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+    timeline.recordResponseDone("resp_1", "cancelled");
+    clock.advance(300);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Actually, never mind.");
+
+    // Later, a genuine audible barge-in against resp_2.
+    clock.advance(500);
+    timeline.recordResponseCreated("resp_2");
+    clock.advance(200);
+    timeline.recordAiAudioStarted("resp_2");
+    clock.advance(600);
+    timeline.recordUserSpeechStarted("item_2");
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+    clock.advance(100);
+    timeline.recordAiAudioStopped("resp_2");
+    timeline.recordResponseDone("resp_2", "cancelled");
+    clock.advance(400);
+    timeline.recordUserSpeechStopped("item_2");
+    timeline.recordUserTranscript("item_2", "Wait, let me jump in.");
+
+    const snapshot = timeline.finalize();
+
+    // Two technical barge-ins total, but only one was audible.
+    expect(snapshot.confirmedBargeIns).toHaveLength(2);
+    expect(snapshot.session.technicalBargeInCount).toBe(2);
+    expect(snapshot.session.confirmedInterruptionCount).toBe(1);
+    expect(snapshot.confirmedBargeIns.filter((b) => b.context === "audible")).toHaveLength(1);
+    expect(snapshot.confirmedBargeIns.filter((b) => b.context === "pre_playback")).toHaveLength(1);
+
+    // Only the one real (played) AI turn exists — resp_1 never produced audio, so no phantom turn.
+    expect(snapshot.aiTurns).toHaveLength(1);
+    expect(snapshot.aiTurns[0].responseId).toBe("resp_2");
+    expect(snapshot.aiTurns[0].wasInterrupted).toBe(true);
+
+    // Only the audible barge-in against resp_2 produces overlap; the pre-playback one contributes none.
+    expect(snapshot.session.overlapCount).toBe(1);
+    expect(snapshot.overlaps[0].aiResponseId).toBe("resp_2");
   });
 });

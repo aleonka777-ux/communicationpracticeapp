@@ -36,6 +36,7 @@ function basePayload(): MetricsPayload {
       totalOverlapMs: 0,
       overlapCount: 0,
       confirmedInterruptionCount: 0,
+      technicalBargeInCount: 0,
       suspectedNoiseEventCount: 0,
       avgUserTurnDurationMs: null,
       longestUserTurnMs: null,
@@ -188,7 +189,7 @@ describe("mapMetricsPayloadToTurnEvents", () => {
       userItemId: "item_1",
       aiResponseId: "resp_1",
     });
-    payload.confirmedBargeIns.push({ atMs: 999.9, aiResponseId: "resp_1" });
+    payload.confirmedBargeIns.push({ atMs: 999.9, aiResponseId: "resp_1", context: "audible" });
 
     const events = mapMetricsPayloadToTurnEvents(payload);
 
@@ -207,6 +208,7 @@ describe("mapMetricsPayloadToTurnEvents", () => {
 
     const bargeInEvent = events.find((e) => e.kind === "confirmed_barge_in")!;
     expect(bargeInEvent.start_ms).toBe(999.9);
+    expect(bargeInEvent.barge_in_context).toBe("audible");
   });
 
   it("keeps turn_index as a whole number while every ms field stays untouched", () => {
@@ -246,6 +248,7 @@ describe("mapMetricsPayloadToSessionMetrics", () => {
       totalOverlapMs: 512.5,
       overlapCount: 2,
       confirmedInterruptionCount: 1,
+      technicalBargeInCount: 2,
       suspectedNoiseEventCount: 3,
       avgUserTurnDurationMs: 950.125,
       longestUserTurnMs: 1800.875,
@@ -276,6 +279,8 @@ describe("mapMetricsPayloadToSessionMetrics", () => {
     expect(Number.isInteger(row.ai_turn_count)).toBe(true);
     expect(Number.isInteger(row.overlap_count)).toBe(true);
     expect(Number.isInteger(row.confirmed_interruption_count)).toBe(true);
+    expect(Number.isInteger(row.technical_barge_in_count)).toBe(true);
+    expect(row.technical_barge_in_count).toBe(2);
     expect(Number.isInteger(row.suspected_noise_event_count)).toBe(true);
   });
 
