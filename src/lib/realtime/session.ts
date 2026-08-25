@@ -42,10 +42,24 @@ export async function createRealtimeClientCredential(
         audio: {
           input: {
             transcription: { model: "whisper-1" },
+            // interrupt_response is deliberately false: the API cancels the active AI response
+            // the instant a single speech_started VAD event arrives, server-side, with no
+            // minimum-duration check — production evidence (false interruptions with speakers,
+            // none with headphones) points at acoustic echo triggering exactly that. The client
+            // (src/lib/realtime/bargeIn.ts) now makes the interrupt decision itself, only after
+            // speech has persisted for a short confirmation window, and cancels explicitly via
+            // response.cancel. create_response stays true so a reply is still generated
+            // automatically once the user's real turn ends. threshold raised from the SDK
+            // default (0.5) to 0.6 — a moderate increase, not toggled to an extreme — since
+            // leaked speaker echo reaching the mic is typically quieter than direct speech;
+            // silence_duration_ms and prefix_padding_ms are left at their defaults (500ms/300ms)
+            // since they govern when speech is judged to have ENDED, not whether it should count
+            // as started, which is the actual failure mode here. See /docs/DECISIONS.md.
             turn_detection: {
               type: "server_vad",
               create_response: true,
-              interrupt_response: true,
+              interrupt_response: false,
+              threshold: 0.6,
             },
           },
           output: {

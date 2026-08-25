@@ -8,10 +8,26 @@
 
 const REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls";
 
+/**
+ * Requested as plain (non-`exact`) boolean constraints, which the WebRTC spec treats as "ideal":
+ * a browser or device that doesn't support one simply ignores it rather than rejecting the whole
+ * getUserMedia() call with OverconstrainedError — unlike `{ exact: true }`, this can never throw
+ * just because a constraint isn't honored, so this stays safe across browsers with partial
+ * support. Actual applied values are verified afterwards via track.getSettings() (see
+ * onMicTrackSettings) rather than assumed.
+ */
+export const MIC_AUDIO_CONSTRAINTS: MediaTrackConstraints = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
+
 export interface RealtimeConnectionHandlers {
   onServerEvent: (event: Record<string, unknown>) => void;
   onRemoteTrack: (stream: MediaStream) => void;
   onConnectionStateChange?: (state: RTCPeerConnectionState) => void;
+  /** Diagnostic only — the settings the browser actually applied, never the audio itself. */
+  onMicTrackSettings?: (settings: MediaTrackSettings) => void;
 }
 
 export interface RealtimeConnection {
@@ -48,7 +64,16 @@ export async function connectRealtimeSession(
   clientSecret: string,
   handlers: RealtimeConnectionHandlers,
 ): Promise<RealtimeConnection> {
-  const localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const localStream = await navigator.mediaDevices.getUserMedia({ audio: MIC_AUDIO_CONSTRAINTS });
+
+  const [audioTrack] = localStream.getAudioTracks();
+  if (audioTrack && handlers.onMicTrackSettings) {
+    try {
+      handlers.onMicTrackSettings(audioTrack.getSettings());
+    } catch {
+      // Diagnostic only — never let a getSettings() quirk on some browser fail the call.
+    }
+  }
 
   const pc = new RTCPeerConnection();
   localStream.getTracks().forEach((track) => pc.addTrack(track, localStream));

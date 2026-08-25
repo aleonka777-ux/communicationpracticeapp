@@ -15,6 +15,8 @@ import { connectRealtimeSession, type RealtimeConnection } from "@/lib/realtime/
 import { waitForPendingUserTranscription } from "@/lib/realtime/pendingTranscription";
 import { waitForCurrentExchangeToFinish } from "@/lib/realtime/exchangeCompletion";
 import { logFinalizationStage } from "@/lib/realtime/finalizationLog";
+import { createBargeInController } from "@/lib/realtime/bargeIn";
+import { logRealtimeDebugEvent } from "@/lib/realtime/debugLog";
 
 const NAVIGATION_STALL_TIMEOUT_MS = 8000;
 
@@ -69,6 +71,8 @@ export function RealtimeSimulationClient({
   const pendingUserTranscriptionRef = useRef(false);
   const stateRef = useRef<RealtimeConnectionState>(state);
   const navigationStartedAtRef = useRef<number | null>(null);
+  /** Diagnostics only, for telling a real barge-in apart from echo/noise — see debugLog.ts. */
+  const aiAudioSpeechIncidentRef = useRef<{ startedAt: number; wasInterrupted: boolean } | null>(null);
 
   useEffect(() => {
     stateRef.current = state;
@@ -168,9 +172,32 @@ export function RealtimeSimulationClient({
         { sessionId },
       );
 
+      // Makes the actual interrupt decision instead of trusting the API's own interrupt_response
+      // (disabled server-side, see session.ts) — a single VAD start event while the AI is talking
+      // is exactly the acoustic-echo failure mode reported in production, so this only treats it
+      // as genuine barge-in once speech has persisted for a short confirmation window.
+      const bargeIn = createBargeInController({
+        onImmediateSpeechStart: () => {
+          dispatch({ type: "USER_STARTED_SPEAKING" });
+        },
+        onConfirmedBargeIn: () => {
+          if (aiAudioSpeechIncidentRef.current) aiAudioSpeechIncidentRef.current.wasInterrupted = true;
+          connection.sendEvent({ type: "response.cancel" });
+          logRealtimeDebugEvent(sessionId, "response_cancelled", { reason: "confirmed_bargein" });
+          dispatch({ type: "USER_STARTED_SPEAKING" });
+        },
+        onSpeechStoppedAfterReport: () => {
+          pendingUserTranscriptionRef.current = true;
+          dispatch({ type: "USER_STOPPED_SPEAKING" });
+        },
+      });
+
       const connection = await connectRealtimeSession(clientSecret, {
         onRemoteTrack: (stream) => {
           if (remoteAudioRef.current) remoteAudioRef.current.srcObject = stream;
+        },
+        onMicTrackSettings: (settings) => {
+          logRealtimeDebugEvent(sessionId, "mic_track_settings", { settings });
         },
         onConnectionStateChange: (pcState) => {
           if (pcState === "connected") setPeerConnectivity("connected");
@@ -205,27 +232,52 @@ export function RealtimeSimulationClient({
               dispatch({ type: "CONNECTED" });
               break;
             }
-            case "input_audio_buffer.speech_started":
-              dispatch({ type: "USER_STARTED_SPEAKING" });
+            case "input_audio_buffer.speech_started": {
+              const aiWasSpeaking = stateRef.current === "speaking";
+              logRealtimeDebugEvent(sessionId, "speech_started", { uiState: stateRef.current, aiAudioPlaying: aiWasSpeaking });
+              aiAudioSpeechIncidentRef.current = aiWasSpeaking ? { startedAt: Date.now(), wasInterrupted: false } : null;
+              bargeIn.handleSpeechStarted();
               break;
-            case "input_audio_buffer.speech_stopped":
-              pendingUserTranscriptionRef.current = true;
-              dispatch({ type: "USER_STOPPED_SPEAKING" });
+            }
+            case "input_audio_buffer.speech_stopped": {
+              logRealtimeDebugEvent(sessionId, "speech_stopped");
+              const incident = aiAudioSpeechIncidentRef.current;
+              if (incident) {
+                logRealtimeDebugEvent(sessionId, "speech_started_during_ai_audio", {
+                  durationMs: Date.now() - incident.startedAt,
+                  wasInterrupted: incident.wasInterrupted,
+                });
+              }
+              bargeIn.handleSpeechStopped();
               break;
+            }
             case "conversation.item.input_audio_transcription.completed": {
               pendingUserTranscriptionRef.current = false;
               const transcript = String(event.transcript ?? "").trim();
+              logRealtimeDebugEvent(sessionId, "user_transcription_completed", {
+                hasMeaningfulTranscript: transcript.length > 0,
+                followsSpeechDuringAiAudio: aiAudioSpeechIncidentRef.current !== null,
+              });
+              aiAudioSpeechIncidentRef.current = null;
               if (transcript) void enqueueTranscript("user", transcript);
               break;
             }
             case "conversation.item.input_audio_transcription.failed":
               pendingUserTranscriptionRef.current = false;
+              logRealtimeDebugEvent(sessionId, "user_transcription_failed", {
+                followsSpeechDuringAiAudio: aiAudioSpeechIncidentRef.current !== null,
+              });
+              aiAudioSpeechIncidentRef.current = null;
               console.error("[voice:realtime] user speech transcription failed (turn continues)", event.error);
               break;
             case "output_audio_buffer.started":
+              logRealtimeDebugEvent(sessionId, "ai_audio_started");
+              bargeIn.handleAiSpeakingChanged(true);
               dispatch({ type: "AI_STARTED_SPEAKING" });
               break;
             case "output_audio_buffer.stopped":
+              logRealtimeDebugEvent(sessionId, "ai_audio_completed");
+              bargeIn.handleAiSpeakingChanged(false);
               dispatch({ type: "AI_FINISHED_SPEAKING" });
               break;
             case "response.output_audio_transcript.done": {
