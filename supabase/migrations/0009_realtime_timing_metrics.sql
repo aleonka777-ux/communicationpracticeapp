@@ -23,6 +23,11 @@ create table if not exists public.realtime_turn_events (
   realtime_item_id text,
   realtime_response_id text,
   message_id uuid references public.conversation_messages (id) on delete set null,
+  -- user_turn rows only: whether this raw speech_started/speech_stopped pair is a real user
+  -- communication turn or a likely false VAD/echo event excluded from every derived session
+  -- metric. See src/lib/realtime/sessionTimeline.ts's classification doc comment for the rule.
+  user_turn_classification text check (user_turn_classification in ('confirmed', 'suspected_noise')),
+  transcription_failed boolean,
   metadata jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now()
 );
@@ -34,6 +39,8 @@ comment on column public.realtime_turn_events.was_interrupted is 'ai_turn only: 
 comment on column public.realtime_turn_events.ended_by_session_close is 'True when the turn never received its natural stop event and was closed only because the session ended (e.g. manual End Practice, which does not wait for the exchange to finish).';
 comment on column public.realtime_turn_events.realtime_item_id is 'OpenAI Realtime item_id, for user_turn rows — external API id, not a foreign key, kept for raw traceability.';
 comment on column public.realtime_turn_events.realtime_response_id is 'OpenAI Realtime response_id, for ai_turn (and correlated overlap/confirmed_barge_in) rows.';
+comment on column public.realtime_turn_events.user_turn_classification is 'user_turn rows only. "suspected_noise" rows are still stored here for diagnostics/audit but are EXCLUDED from realtime_session_metrics (turn counts, speaking time, response latency, overlap) — a raw speech_started/speech_stopped pair alone is not evidence of a real user turn (speaker-echo false positives are known to occur). Null for every other kind.';
+comment on column public.realtime_turn_events.transcription_failed is 'user_turn rows only. True when the server explicitly reported it could not transcribe this segment — one input to user_turn_classification. Null for every other kind.';
 comment on column public.realtime_turn_events.metadata is 'Small structured extras only (e.g. cancellation reason) — the analytics model is NOT dumped into this blob; stable/known metrics are real columns above.';
 
 create index if not exists realtime_turn_events_session_id_idx on public.realtime_turn_events (session_id, start_ms);
@@ -54,6 +61,7 @@ create table if not exists public.realtime_session_metrics (
   total_overlap_ms integer not null default 0,
   overlap_count integer not null default 0,
   confirmed_interruption_count integer not null default 0,
+  suspected_noise_event_count integer not null default 0,
   avg_user_turn_duration_ms integer,
   longest_user_turn_ms integer,
   avg_ai_turn_duration_ms integer,
@@ -66,6 +74,7 @@ create table if not exists public.realtime_session_metrics (
 );
 
 comment on table public.realtime_session_metrics is 'Session-level derived timing/interruption metrics. Not yet used by the Evaluation Engine or shown in production UI — a measurement layer only (see /docs/DECISIONS.md).';
+comment on column public.realtime_session_metrics.suspected_noise_event_count is 'Count of raw speech_started/speech_stopped pairs classified suspected_noise and excluded from every other metric in this row — see realtime_turn_events.user_turn_classification.';
 comment on column public.realtime_session_metrics.avg_user_response_latency_ms is 'Coaching-relevant candidate for later use: user speech start minus the immediately preceding non-overlapping AI turn''s end. Excludes overlapping/interrupted exchanges by construction.';
 comment on column public.realtime_session_metrics.avg_ai_response_latency_ms is 'System/product-quality metric ONLY (network + model latency) — never a user communication-performance signal, and must never be used to penalize a user for slow infrastructure.';
 

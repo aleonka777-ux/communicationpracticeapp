@@ -23,11 +23,12 @@ describe("createSessionTimeline", () => {
     timeline.recordAiAudioStopped("resp_1");
     timeline.recordResponseDone("resp_1", "completed");
 
-    // User responds: 2.5s -> 4.5s (2s duration)
+    // User responds: 2.5s -> 4.5s (2s duration), transcribed
     clock.advance(500);
     timeline.recordUserSpeechStarted("item_1");
     clock.advance(2000);
     timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "I can do Friday at 3pm.");
 
     // AI replies: 5s -> 7s
     clock.advance(500);
@@ -43,6 +44,7 @@ describe("createSessionTimeline", () => {
     expect(snapshot.aiTurns[0].turnIndex).toBe(1);
     expect(snapshot.aiTurns[1].turnIndex).toBe(2);
     expect(snapshot.userTurns[0].turnIndex).toBe(1);
+    expect(snapshot.userTurns[0].classification).toBe("confirmed");
     expect(snapshot.session.userTurnCount).toBe(1);
     expect(snapshot.session.aiTurnCount).toBe(2);
   });
@@ -54,6 +56,7 @@ describe("createSessionTimeline", () => {
     timeline.recordUserSpeechStarted("item_1", 1000);
     clock.advance(3000); // client clock says 3000ms, server says 2500ms
     timeline.recordUserSpeechStopped("item_1", 3500);
+    timeline.recordUserTranscript("item_1", "Sounds good, let's do that.");
 
     const snapshot = timeline.finalize();
     expect(snapshot.userTurns[0].durationSource).toBe("server_vad");
@@ -67,6 +70,7 @@ describe("createSessionTimeline", () => {
     timeline.recordUserSpeechStarted("item_1");
     clock.advance(1800);
     timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "That works for me.");
 
     const snapshot = timeline.finalize();
     expect(snapshot.userTurns[0].durationSource).toBe("client_playback");
@@ -85,6 +89,7 @@ describe("createSessionTimeline", () => {
     timeline.recordUserSpeechStarted("item_1");
     clock.advance(1000);
     timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Okay, that makes sense.");
 
     const snapshot = timeline.finalize();
     expect(snapshot.session.avgUserResponseLatencyMs).toBe(700);
@@ -99,6 +104,7 @@ describe("createSessionTimeline", () => {
     timeline.recordUserSpeechStarted("item_1");
     clock.advance(1000);
     timeline.recordUserSpeechStopped("item_1"); // user ends at 1000ms
+    timeline.recordUserTranscript("item_1", "Can we talk about the deadline?");
 
     clock.advance(450); // system takes 450ms to start responding
     timeline.recordAiAudioStarted("resp_1");
@@ -122,6 +128,7 @@ describe("createSessionTimeline", () => {
     timeline.recordAiAudioStopped("resp_1"); // AI ends at 1500ms, after the user already started at 1000ms
     clock.advance(500);
     timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Actually, wait a second.");
 
     const snapshot = timeline.finalize();
     // No AI turn ends strictly before this user turn starts, so there is no latency sample for it.
@@ -129,39 +136,48 @@ describe("createSessionTimeline", () => {
     expect(snapshot.session.userTurnCount).toBe(1);
   });
 
-  it("counts a confirmed barge-in and marks the interrupted AI turn, without double-counting its duration", () => {
+  it("classifies a confirmed barge-in as a real user turn regardless of transcript or duration", () => {
     const clock = createClock();
     const timeline = createSessionTimeline({ now: clock.now });
 
     timeline.recordAiAudioStarted("resp_1");
-    clock.advance(1200);
+    clock.advance(1000);
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(120); // brief, and no transcript ever arrives for it
     timeline.recordConfirmedBargeIn();
-    clock.advance(100);
+    clock.advance(30);
     timeline.recordResponseCancelled("resp_1", "confirmed_bargein");
-    timeline.recordAiAudioStopped("resp_1"); // playback actually stops at 1300ms
+    timeline.recordAiAudioStopped("resp_1");
     timeline.recordResponseDone("resp_1", "cancelled");
+    clock.advance(200);
+    timeline.recordUserSpeechStopped("item_1");
 
     const snapshot = timeline.finalize();
     expect(snapshot.confirmedBargeIns).toHaveLength(1);
     expect(snapshot.session.confirmedInterruptionCount).toBe(1);
-    expect(snapshot.aiTurns).toHaveLength(1);
     expect(snapshot.aiTurns[0].wasInterrupted).toBe(true);
-    expect(snapshot.aiTurns[0].durationMs).toBe(1300); // the one true stop event, not counted twice
+    expect(snapshot.aiTurns[0].durationMs).toBe(1150); // the one true stop event, not counted twice
+
+    // The interrupting user turn itself: a sustained, confirmed interruption is unambiguous
+    // evidence of real speech, so it's "confirmed" even with no transcript and a short duration.
+    expect(snapshot.userTurns).toHaveLength(1);
+    expect(snapshot.userTurns[0].classification).toBe("confirmed");
+    expect(snapshot.userTurns[0].turnIndex).toBe(1);
+    expect(snapshot.session.userTurnCount).toBe(1);
   });
 
-  it("does not count a brief false VAD blip (no confirmed barge-in) as an interruption", () => {
+  it("classifies a speaker-echo VAD blip with no meaningful transcription as suspected noise, excluded from all session metrics", () => {
     const clock = createClock();
     const timeline = createSessionTimeline({ now: clock.now });
 
     timeline.recordAiAudioStarted("resp_1");
     clock.advance(500);
-    // A raw speech_started/speech_stopped pair occurs (e.g. echo), but the barge-in controller
-    // never confirms it, so recordConfirmedBargeIn() is never called for it — this is the whole
-    // point: the timeline only trusts the confirmed-barge-in signal, never raw VAD events.
+    // A raw speech_started/speech_stopped pair occurs (e.g. echo). No confirmed barge-in ever
+    // fires for it (the barge-in controller never confirmed it), and no transcript ever arrives.
     timeline.recordUserSpeechStarted("item_blip");
-    clock.advance(50);
+    clock.advance(80);
     timeline.recordUserSpeechStopped("item_blip");
-    clock.advance(1450);
+    clock.advance(1420);
     timeline.recordAiAudioStopped("resp_1");
     timeline.recordResponseDone("resp_1", "completed");
 
@@ -169,30 +185,119 @@ describe("createSessionTimeline", () => {
     expect(snapshot.confirmedBargeIns).toHaveLength(0);
     expect(snapshot.session.confirmedInterruptionCount).toBe(0);
     expect(snapshot.aiTurns[0].wasInterrupted).toBe(false);
-    // The blip is still recorded as its own (very short) user turn, just not as an interruption.
+
+    // The blip is still returned in userTurns for diagnostics, but classified out of everything.
     expect(snapshot.userTurns).toHaveLength(1);
-    expect(snapshot.userTurns[0].durationMs).toBe(50);
+    expect(snapshot.userTurns[0].classification).toBe("suspected_noise");
+    expect(snapshot.userTurns[0].turnIndex).toBeNull();
+    expect(snapshot.userTurns[0].durationMs).toBe(80);
+
+    expect(snapshot.session.userTurnCount).toBe(0);
+    expect(snapshot.session.totalUserSpeakingMs).toBe(0);
+    expect(snapshot.session.avgUserTurnDurationMs).toBeNull();
+    expect(snapshot.session.longestUserTurnMs).toBeNull();
+    expect(snapshot.session.suspectedNoiseEventCount).toBe(1);
   });
 
-  it("computes overlap duration as the intersection of a user speech interval and an AI playback interval, distinct from confirmed barge-in", () => {
+  it("classifies a genuine short spoken response ('yes') with valid transcription as confirmed, however brief", () => {
     const clock = createClock();
     const timeline = createSessionTimeline({ now: clock.now });
 
     timeline.recordAiAudioStarted("resp_1");
-    clock.advance(1000);
-    timeline.recordUserSpeechStarted("item_1"); // overlap starts at 1000ms
+    clock.advance(500);
+    timeline.recordAiAudioStopped("resp_1");
+    timeline.recordResponseDone("resp_1", "completed");
+
     clock.advance(300);
-    timeline.recordAiAudioStopped("resp_1"); // AI ends at 1300ms -> overlap ends here
-    clock.advance(200);
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(90); // as short as the echo blip above
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Yes.");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.userTurns).toHaveLength(1);
+    expect(snapshot.userTurns[0].classification).toBe("confirmed");
+    expect(snapshot.userTurns[0].turnIndex).toBe(1);
+    expect(snapshot.userTurns[0].durationMs).toBe(90);
+    expect(snapshot.session.userTurnCount).toBe(1);
+    expect(snapshot.session.totalUserSpeakingMs).toBe(90);
+    expect(snapshot.session.suspectedNoiseEventCount).toBe(0);
+  });
+
+  it("classifies an explicit transcription failure as suspected noise even at a longer, ambiguous duration", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(900); // well above the no-evidence duration fallback threshold
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscriptionFailed("item_1");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.userTurns[0].classification).toBe("suspected_noise");
+    expect(snapshot.userTurns[0].transcriptionFailed).toBe(true);
+    expect(snapshot.session.userTurnCount).toBe(0);
+  });
+
+  it("classifies a completed-but-empty transcription as suspected noise", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(900);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "   "); // completed, but no actual words
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.userTurns[0].classification).toBe("suspected_noise");
+    expect(snapshot.session.userTurnCount).toBe(0);
+  });
+
+  it("does not treat a very short event with no transcript evidence at all as confirmed", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(60); // short, and transcription never arrives (not completed, not failed)
     timeline.recordUserSpeechStopped("item_1");
 
     const snapshot = timeline.finalize();
+    expect(snapshot.userTurns[0].classification).toBe("suspected_noise");
+  });
+
+  it("excludes a suspected-noise event from overlap, while a genuine overlapping turn is still counted", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    // A noise blip that happens to coincide with AI playback must not register as overlap.
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(200);
+    timeline.recordUserSpeechStarted("item_blip");
+    clock.advance(70);
+    timeline.recordUserSpeechStopped("item_blip"); // no transcript ever arrives -> suspected_noise
+    clock.advance(730);
+    timeline.recordAiAudioStopped("resp_1"); // AI turn: 0 -> 1000ms
+    timeline.recordResponseDone("resp_1", "completed");
+
+    // A genuine, transcribed overlap.
+    clock.advance(500);
+    timeline.recordAiAudioStarted("resp_2");
+    clock.advance(300);
+    timeline.recordUserSpeechStarted("item_genuine"); // overlap starts here
+    clock.advance(200);
+    timeline.recordAiAudioStopped("resp_2"); // AI turn ends -> overlap ends here
+    timeline.recordResponseDone("resp_2", "completed");
+    clock.advance(400);
+    timeline.recordUserSpeechStopped("item_genuine");
+    timeline.recordUserTranscript("item_genuine", "Hold on, let me finish.");
+
+    const snapshot = timeline.finalize();
     expect(snapshot.overlaps).toHaveLength(1);
-    expect(snapshot.overlaps[0].durationMs).toBe(300);
-    expect(snapshot.session.totalOverlapMs).toBe(300);
+    expect(snapshot.overlaps[0].userItemId).toBe("item_genuine");
+    expect(snapshot.overlaps[0].durationMs).toBe(200);
     expect(snapshot.session.overlapCount).toBe(1);
-    // Overlap alone (no recordConfirmedBargeIn call) must never be reported as an interruption.
-    expect(snapshot.session.confirmedInterruptionCount).toBe(0);
+    expect(snapshot.session.totalOverlapMs).toBe(200);
+    expect(snapshot.session.suspectedNoiseEventCount).toBe(1);
   });
 
   it("closes an AI turn left open by graceful timer completion without marking it interrupted", () => {
@@ -216,6 +321,7 @@ describe("createSessionTimeline", () => {
     timeline.recordUserSpeechStarted("item_1");
     clock.advance(800);
     timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "I think we're done here.");
 
     clock.advance(200);
     timeline.recordAiAudioStarted("resp_1");
@@ -238,6 +344,7 @@ describe("createSessionTimeline", () => {
     clock.advance(1000);
     timeline.recordUserSpeechStopped("item_1");
     timeline.recordUserSpeechStopped("item_1"); // duplicate stop
+    timeline.recordUserTranscript("item_1", "Let's move forward with the plan.");
     clock.advance(500);
 
     timeline.recordAiAudioStarted("resp_1");
@@ -260,6 +367,7 @@ describe("createSessionTimeline", () => {
     timeline.recordUserSpeechStarted("item_1");
     clock.advance(1000);
     timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Understood, thanks.");
 
     const first = timeline.finalize();
     clock.advance(5000);
@@ -270,7 +378,7 @@ describe("createSessionTimeline", () => {
     expect(second.userTurns[0].durationMs).toBe(1000); // unchanged by the second finalize
   });
 
-  it("stores only timestamps, durations, transcripts and small metadata — never raw audio", () => {
+  it("stores only timestamps, durations, transcripts, classification and small metadata — never raw audio", () => {
     const clock = createClock();
     const timeline = createSessionTimeline({ now: clock.now });
 
@@ -292,6 +400,7 @@ describe("createSessionTimeline", () => {
     // audio payloads anywhere in the snapshot that gets persisted.
     const allowedKeys = new Set([
       "turnIndex",
+      "classification",
       "itemId",
       "startMs",
       "endMs",
@@ -301,6 +410,7 @@ describe("createSessionTimeline", () => {
       "serverAudioStartMs",
       "serverAudioEndMs",
       "transcript",
+      "transcriptionFailed",
       "responseId",
       "wasInterrupted",
       "responseStatus",
@@ -324,6 +434,7 @@ describe("createSessionTimeline", () => {
       "totalOverlapMs",
       "overlapCount",
       "confirmedInterruptionCount",
+      "suspectedNoiseEventCount",
       "avgUserTurnDurationMs",
       "longestUserTurnMs",
       "avgAiTurnDurationMs",

@@ -165,6 +165,13 @@ export interface EvaluationRow {
 export type RealtimeTurnEventKind = "user_turn" | "ai_turn" | "overlap" | "confirmed_barge_in";
 export type RealtimeTurnDurationSource = "server_vad" | "client_playback";
 export type RealtimeResponseStatus = "completed" | "cancelled" | "failed" | "incomplete" | "in_progress";
+/**
+ * user_turn rows only — whether this raw speech_started/speech_stopped pair is treated as a real
+ * user communication turn ("confirmed") or excluded from all derived session metrics as a likely
+ * false VAD/echo event ("suspected_noise"). See src/lib/realtime/sessionTimeline.ts's classification
+ * doc comment for the exact rule. Null for every other event kind.
+ */
+export type RealtimeUserTurnClassification = "confirmed" | "suspected_noise";
 
 /**
  * One row per user turn, AI turn, overlap interval, or confirmed barge-in — see
@@ -189,6 +196,8 @@ export interface RealtimeTurnEventRow {
   realtime_item_id: string | null;
   realtime_response_id: string | null;
   message_id: string | null;
+  user_turn_classification: RealtimeUserTurnClassification | null;
+  transcription_failed: boolean | null;
   metadata: Record<string, unknown>;
   created_at: string;
 }
@@ -207,6 +216,7 @@ export interface RealtimeSessionMetricsRow {
   total_overlap_ms: number;
   overlap_count: number;
   confirmed_interruption_count: number;
+  suspected_noise_event_count: number;
   avg_user_turn_duration_ms: number | null;
   longest_user_turn_ms: number | null;
   avg_ai_turn_duration_ms: number | null;

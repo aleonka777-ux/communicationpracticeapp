@@ -27,13 +27,39 @@
  *   VAD/echo events are already known to occur and must not count as interruptions.
  * - AI turn outcome: `response.done`'s `response.status` (`completed`/`cancelled`/`failed`/
  *   `incomplete`) — the server's own authoritative record of whether a turn was cut short.
+ *
+ * User-speech-event classification: a raw `speech_started` -> `speech_stopped` pair is NOT by
+ * itself evidence that a real user communication turn occurred — production testing has confirmed
+ * false `speech_started` events from speaker echo. Every such event is classified as either
+ * "confirmed" (a real turn) or "suspected_noise" (excluded from all derived turn/speaking-time/
+ * latency/overlap metrics) using, in priority order:
+ *   1. It triggered a confirmed barge-in (src/lib/realtime/bargeIn.ts) -> always "confirmed",
+ *      regardless of transcript state — a sustained, confirmed interruption is unambiguous
+ *      evidence of real speech on its own. This is a purely retrospective metrics decision; it
+ *      does not gate or delay the live barge-in behavior itself.
+ *   2. It has a non-empty transcript -> "confirmed". Meaningful transcript text ("yes", "no",
+ *      "why?") is direct evidence of real speech regardless of how short the utterance was — short
+ *      genuine replies must never be discarded just for being brief.
+ *   3. Transcription explicitly failed, or explicitly completed with empty text -> "suspected_
+ *      noise". The server's own transcriber concluding there was no speech to transcribe is strong
+ *      negative evidence, independent of duration.
+ *   4. Otherwise (no transcript ever arrived — still pending, or lost) -> fall back to duration,
+ *      the only remaining evidence, via `AMBIGUOUS_NO_TRANSCRIPT_MIN_MS`. OpenAI's default
+ *      `silence_duration_ms` (500ms, left unset/default in session.ts) means the server already
+ *      waits ~500ms of silence before emitting `speech_stopped`, so genuine turns are rarely this
+ *      short — but this path errs toward keeping anything but the briefest events rather than
+ *      inventing certainty duration alone can't provide.
  */
 
 export type TurnDurationSource = "server_vad" | "client_playback";
 export type AiResponseStatus = "completed" | "cancelled" | "failed" | "incomplete" | "in_progress";
+export type UserSpeechEventClassification = "confirmed" | "suspected_noise";
 
 export interface UserTurnMetric {
-  turnIndex: number;
+  /** Sequential index among CONFIRMED turns only — null for a suspected_noise event, since it is
+   *  not part of the numbered conversation. See the classification doc comment above. */
+  turnIndex: number | null;
+  classification: UserSpeechEventClassification;
   itemId: string;
   startMs: number;
   endMs: number;
@@ -44,6 +70,7 @@ export interface UserTurnMetric {
   serverAudioStartMs: number | null;
   serverAudioEndMs: number | null;
   transcript: string | null;
+  transcriptionFailed: boolean;
 }
 
 export interface AiTurnMetric {
@@ -92,6 +119,9 @@ export interface SessionLevelMetrics {
   totalOverlapMs: number;
   overlapCount: number;
   confirmedInterruptionCount: number;
+  /** Raw speech_started/speech_stopped pairs classified suspected_noise and excluded from every
+   *  metric above — see the module doc comment. Diagnostic visibility only. */
+  suspectedNoiseEventCount: number;
   avgUserTurnDurationMs: number | null;
   longestUserTurnMs: number | null;
   avgAiTurnDurationMs: number | null;
@@ -115,13 +145,16 @@ export interface SessionTimelineSnapshot {
 }
 
 interface MutableUserTurn {
-  turnIndex: number;
   itemId: string;
   startMs: number;
   endMs: number | null;
   serverAudioStartMs: number | null;
   serverAudioEndMs: number | null;
   transcript: string | null;
+  transcriptionFailed: boolean;
+  /** Set retrospectively by recordConfirmedBargeIn() if this was the open user turn at the moment
+   *  of confirmation — see the classification doc comment above (rule 1). */
+  triggeredConfirmedBargeIn: boolean;
 }
 
 interface MutableAiTurn {
@@ -142,7 +175,11 @@ export interface SessionTimelineOptions {
 export interface SessionTimeline {
   recordUserSpeechStarted(itemId: string, serverAudioStartMs?: number | null): void;
   recordUserSpeechStopped(itemId: string, serverAudioEndMs?: number | null): void;
+  /** transcript may be an empty string — a completed transcription with no text is itself
+   *  classification evidence (see the module doc comment, rule 3), distinct from never receiving
+   *  a completion event at all. */
   recordUserTranscript(itemId: string, transcript: string): void;
+  recordUserTranscriptionFailed(itemId: string): void;
   recordAiAudioStarted(responseId: string): void;
   recordAiAudioStopped(responseId: string): void;
   recordAiTranscript(responseId: string, transcript: string): void;
@@ -167,6 +204,24 @@ function median(values: number[]): number | null {
   return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
+/** See the module doc comment's classification rule 4 — the last-resort fallback when a user
+ *  speech event has no transcript evidence in either direction. */
+const AMBIGUOUS_NO_TRANSCRIPT_MIN_MS = 300;
+
+function classifyUserSpeechEvent(turn: {
+  durationMs: number;
+  transcript: string | null;
+  transcriptionFailed: boolean;
+  triggeredConfirmedBargeIn: boolean;
+}): UserSpeechEventClassification {
+  if (turn.triggeredConfirmedBargeIn) return "confirmed";
+  const trimmed = turn.transcript?.trim() ?? "";
+  if (trimmed.length > 0) return "confirmed";
+  const completedEmpty = turn.transcript !== null && trimmed.length === 0;
+  if (turn.transcriptionFailed || completedEmpty) return "suspected_noise";
+  return turn.durationMs >= AMBIGUOUS_NO_TRANSCRIPT_MIN_MS ? "confirmed" : "suspected_noise";
+}
+
 export function createSessionTimeline(options: SessionTimelineOptions = {}): SessionTimeline {
   const now = options.now ?? (() => performance.now());
   const sessionStartMs = now();
@@ -179,20 +234,27 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
   const confirmedBargeIns: ConfirmedBargeInMetric[] = [];
   const responseCancellations: ResponseCancelledMetric[] = [];
   let currentAiResponseId: string | null = null;
+  /** The user turn currently open (speech_started received, speech_stopped not yet), if any — a
+   *  confirmed barge-in can only ever fire while this is set (see bargeIn.ts: a blip that stops
+   *  before confirmation never reaches onConfirmedBargeIn), so this is how recordConfirmedBargeIn()
+   *  attributes the confirmation back to the specific user turn that earned it. */
+  let currentOpenUserItemId: string | null = null;
 
   return {
     recordUserSpeechStarted(itemId, serverAudioStartMs = null) {
       if (userTurnsByItemId.has(itemId)) return; // duplicate event guard
       userTurnsByItemId.set(itemId, {
-        turnIndex: userTurnOrder.length + 1,
         itemId,
         startMs: elapsed(),
         endMs: null,
         serverAudioStartMs,
         serverAudioEndMs: null,
         transcript: null,
+        transcriptionFailed: false,
+        triggeredConfirmedBargeIn: false,
       });
       userTurnOrder.push(itemId);
+      currentOpenUserItemId = itemId;
     },
 
     recordUserSpeechStopped(itemId, serverAudioEndMs = null) {
@@ -200,11 +262,17 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
       if (!turn || turn.endMs !== null) return; // no matching start, or already stopped
       turn.endMs = elapsed();
       turn.serverAudioEndMs = serverAudioEndMs;
+      if (currentOpenUserItemId === itemId) currentOpenUserItemId = null;
     },
 
     recordUserTranscript(itemId, transcript) {
       const turn = userTurnsByItemId.get(itemId);
       if (turn) turn.transcript = transcript;
+    },
+
+    recordUserTranscriptionFailed(itemId) {
+      const turn = userTurnsByItemId.get(itemId);
+      if (turn) turn.transcriptionFailed = true;
     },
 
     recordAiAudioStarted(responseId) {
@@ -243,8 +311,13 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
 
     recordConfirmedBargeIn() {
       confirmedBargeIns.push({ atMs: elapsed(), aiResponseId: currentAiResponseId });
-      const turn = currentAiResponseId ? aiTurnsByResponseId.get(currentAiResponseId) : null;
-      if (turn) turn.wasInterrupted = true;
+      const aiTurn = currentAiResponseId ? aiTurnsByResponseId.get(currentAiResponseId) : null;
+      if (aiTurn) aiTurn.wasInterrupted = true;
+      // A confirmed barge-in can only ever fire while the triggering user turn is still open (see
+      // bargeIn.ts — a blip that stops before confirmation never reaches this callback), so
+      // whichever user turn is currently open is unambiguously the one that earned it.
+      const userTurn = currentOpenUserItemId ? userTurnsByItemId.get(currentOpenUserItemId) : null;
+      if (userTurn) userTurn.triggeredConfirmedBargeIn = true;
     },
 
     recordResponseCancelled(responseId, reason) {
@@ -257,13 +330,26 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
       // Close any still-open turn at the finalize instant (e.g. manual End Practice, which — unlike
       // graceful timer completion — doesn't wait for the in-flight exchange to finish) so every
       // turn has a well-defined duration and nothing is silently dropped from the counts.
+      // Classification happens here, once every turn's final state (transcript, transcription
+      // failure, confirmed-barge-in attribution) is known — see the module doc comment. turnIndex
+      // is assigned only to "confirmed" turns, in chronological order, since a suspected_noise
+      // event is not part of the numbered conversation.
+      let confirmedIndex = 0;
       const userTurns: UserTurnMetric[] = userTurnOrder.map((itemId) => {
         const t = userTurnsByItemId.get(itemId)!;
         const endMs = t.endMs ?? finalizedAtMs;
         const hasServerTiming = t.serverAudioStartMs !== null && t.serverAudioEndMs !== null;
         const durationMs = hasServerTiming ? t.serverAudioEndMs! - t.serverAudioStartMs! : endMs - t.startMs;
+        const classification = classifyUserSpeechEvent({
+          durationMs,
+          transcript: t.transcript,
+          transcriptionFailed: t.transcriptionFailed,
+          triggeredConfirmedBargeIn: t.triggeredConfirmedBargeIn,
+        });
+        const turnIndex = classification === "confirmed" ? ++confirmedIndex : null;
         return {
-          turnIndex: t.turnIndex,
+          turnIndex,
+          classification,
           itemId: t.itemId,
           startMs: t.startMs,
           endMs,
@@ -273,8 +359,14 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
           serverAudioStartMs: t.serverAudioStartMs,
           serverAudioEndMs: t.serverAudioEndMs,
           transcript: t.transcript,
+          transcriptionFailed: t.transcriptionFailed,
         };
       });
+      // Everything below derives session-level facts from CONFIRMED user turns only — a
+      // suspected_noise event must never contribute to turn counts, speaking time, response
+      // latency (in either direction), or overlap. It is still returned in `userTurns` above,
+      // unabridged, for diagnostic/audit purposes.
+      const confirmedUserTurns = userTurns.filter((t) => t.classification === "confirmed");
 
       const aiTurns: AiTurnMetric[] = aiTurnOrder.map((responseId) => {
         const t = aiTurnsByResponseId.get(responseId)!;
@@ -292,11 +384,13 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
         };
       });
 
-      // Overlap: objective intersection between a user speech interval and an AI playback
-      // interval, computed on the shared client clock. Deliberately never called "interruption" —
-      // that's the separate, confirmed-barge-in-derived signal above.
+      // Overlap: objective intersection between a CONFIRMED user speech interval and an AI
+      // playback interval, computed on the shared client clock. Deliberately never called
+      // "interruption" — that's the separate, confirmed-barge-in-derived signal above. A
+      // suspected_noise interval is excluded — it was never established as real user speech, so an
+      // AI turn happening to play during an echo blip must not be reported as overlap.
       const overlaps: OverlapIntervalMetric[] = [];
-      for (const u of userTurns) {
+      for (const u of confirmedUserTurns) {
         for (const a of aiTurns) {
           const start = Math.max(u.startMs, a.startMs);
           const end = Math.min(u.endMs, a.endMs);
@@ -306,11 +400,11 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
         }
       }
 
-      // Response latency: for each user turn, the immediately preceding AI turn that finished
-      // strictly before this one started (no overlap — an overlapping pair is a barge-in/overlap,
-      // not ordinary latency, per the product requirement).
+      // Response latency: for each CONFIRMED user turn, the immediately preceding AI turn that
+      // finished strictly before this one started (no overlap — an overlapping pair is a
+      // barge-in/overlap, not ordinary latency, per the product requirement).
       const userResponseLatencies: number[] = [];
-      for (const u of userTurns) {
+      for (const u of confirmedUserTurns) {
         const precedingAi = aiTurns
           .filter((a) => a.endMs <= u.startMs)
           .reduce<AiTurnMetric | null>((latest, a) => (!latest || a.endMs > latest.endMs ? a : latest), null);
@@ -318,22 +412,24 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
       }
 
       // AI ("system") response latency: symmetric, but explicitly a product-quality signal, never
-      // used to judge the user — see the module doc comment and /docs/DECISIONS.md.
+      // used to judge the user — see the module doc comment and /docs/DECISIONS.md. A suspected
+      // noise event must not establish "the user just finished speaking" for this calculation
+      // either.
       const aiResponseLatencies: number[] = [];
       for (const a of aiTurns) {
-        const precedingUser = userTurns
+        const precedingUser = confirmedUserTurns
           .filter((u) => u.endMs <= a.startMs)
           .reduce<UserTurnMetric | null>((latest, u) => (!latest || u.endMs > latest.endMs ? u : latest), null);
         if (precedingUser) aiResponseLatencies.push(a.startMs - precedingUser.endMs);
       }
 
-      const totalUserSpeakingMs = userTurns.reduce((sum, t) => sum + t.durationMs, 0);
+      const totalUserSpeakingMs = confirmedUserTurns.reduce((sum, t) => sum + t.durationMs, 0);
       const totalAiSpeakingMs = aiTurns.reduce((sum, t) => sum + t.durationMs, 0);
       const totalOverlapMs = overlaps.reduce((sum, o) => sum + o.durationMs, 0);
 
       const session: SessionLevelMetrics = {
         totalDurationMs: finalizedAtMs,
-        userTurnCount: userTurns.length,
+        userTurnCount: confirmedUserTurns.length,
         aiTurnCount: aiTurns.length,
         totalUserSpeakingMs,
         totalAiSpeakingMs,
@@ -342,8 +438,9 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
         totalOverlapMs,
         overlapCount: overlaps.length,
         confirmedInterruptionCount: confirmedBargeIns.length,
-        avgUserTurnDurationMs: average(userTurns.map((t) => t.durationMs)),
-        longestUserTurnMs: userTurns.length > 0 ? Math.max(...userTurns.map((t) => t.durationMs)) : null,
+        suspectedNoiseEventCount: userTurns.length - confirmedUserTurns.length,
+        avgUserTurnDurationMs: average(confirmedUserTurns.map((t) => t.durationMs)),
+        longestUserTurnMs: confirmedUserTurns.length > 0 ? Math.max(...confirmedUserTurns.map((t) => t.durationMs)) : null,
         avgAiTurnDurationMs: average(aiTurns.map((t) => t.durationMs)),
         avgUserResponseLatencyMs: average(userResponseLatencies),
         medianUserResponseLatencyMs: median(userResponseLatencies),
@@ -363,7 +460,13 @@ export function formatSessionTimelineDebugLines(snapshot: SessionTimelineSnapsho
   const lines: string[] = [];
 
   for (const t of snapshot.userTurns) {
-    lines.push(`User turn ${t.turnIndex}: start ${toS(t.startMs)}s / end ${toS(t.endMs)}s / duration ${toS(t.durationMs)}s`);
+    if (t.classification === "confirmed") {
+      lines.push(`User turn ${t.turnIndex}: start ${toS(t.startMs)}s / end ${toS(t.endMs)}s / duration ${toS(t.durationMs)}s`);
+    } else {
+      lines.push(
+        `Suspected false VAD/noise event (excluded): start ${toS(t.startMs)}s / end ${toS(t.endMs)}s / duration ${toS(t.durationMs)}s / transcript ${t.transcript === null ? "none received" : t.transcript === "" ? "empty" : `"${t.transcript}"`}${t.transcriptionFailed ? " / transcription failed" : ""}`,
+      );
+    }
   }
   for (const t of snapshot.aiTurns) {
     lines.push(
@@ -378,6 +481,7 @@ export function formatSessionTimelineDebugLines(snapshot: SessionTimelineSnapsho
   }
   lines.push(`Confirmed barge-in: ${snapshot.confirmedBargeIns.length > 0 ? `true (${snapshot.confirmedBargeIns.length})` : "false"}`);
   lines.push(`Overlap: ${snapshot.overlaps.length} interval(s), ${toS(snapshot.session.totalOverlapMs)}s total`);
+  lines.push(`Suspected false VAD/noise events excluded: ${snapshot.session.suspectedNoiseEventCount}`);
 
   return lines;
 }

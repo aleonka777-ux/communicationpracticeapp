@@ -356,10 +356,11 @@ export function RealtimeSimulationClient({
                 isFirstAiResponse: aiAudioSpeechIncidentRef.current?.isFirstAiResponse ?? false,
               });
               aiAudioSpeechIncidentRef.current = null;
-              if (transcript) {
-                metricsRef.current?.recordUserTranscript(String(event.item_id ?? ""), transcript);
-                void enqueueTranscript("user", transcript);
-              }
+              // Recorded even when empty — a completed transcription with no text is itself
+              // classification evidence (see sessionTimeline.ts), distinct from no completion event
+              // ever arriving at all. Only a non-empty transcript is actually persisted below.
+              metricsRef.current?.recordUserTranscript(String(event.item_id ?? ""), transcript);
+              if (transcript) void enqueueTranscript("user", transcript);
               break;
             }
             case "conversation.item.input_audio_transcription.failed":
@@ -368,6 +369,7 @@ export function RealtimeSimulationClient({
                 followsSpeechDuringAiAudio: aiAudioSpeechIncidentRef.current !== null,
                 isFirstAiResponse: aiAudioSpeechIncidentRef.current?.isFirstAiResponse ?? false,
               });
+              metricsRef.current?.recordUserTranscriptionFailed(String(event.item_id ?? ""));
               aiAudioSpeechIncidentRef.current = null;
               console.error("[voice:realtime] user speech transcription failed (turn continues)", event.error);
               break;

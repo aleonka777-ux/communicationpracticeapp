@@ -17,9 +17,13 @@ export const runtime = "nodejs";
 
 const durationSourceSchema = z.enum(["server_vad", "client_playback"]);
 const responseStatusSchema = z.enum(["completed", "cancelled", "failed", "incomplete", "in_progress"]);
+const userSpeechClassificationSchema = z.enum(["confirmed", "suspected_noise"]);
 
 const userTurnSchema = z.object({
-  turnIndex: z.number().int().positive(),
+  // null for a suspected_noise event — it isn't part of the numbered conversation. See
+  // src/lib/realtime/sessionTimeline.ts's classification doc comment.
+  turnIndex: z.number().int().positive().nullable(),
+  classification: userSpeechClassificationSchema,
   itemId: z.string().min(1),
   startMs: z.number(),
   endMs: z.number(),
@@ -29,6 +33,7 @@ const userTurnSchema = z.object({
   serverAudioStartMs: z.number().nullable(),
   serverAudioEndMs: z.number().nullable(),
   transcript: z.string().nullable(),
+  transcriptionFailed: z.boolean(),
 });
 
 const aiTurnSchema = z.object({
@@ -67,6 +72,7 @@ const sessionMetricsSchema = z.object({
   totalOverlapMs: z.number(),
   overlapCount: z.number().int().nonnegative(),
   confirmedInterruptionCount: z.number().int().nonnegative(),
+  suspectedNoiseEventCount: z.number().int().nonnegative(),
   avgUserTurnDurationMs: z.number().nullable(),
   longestUserTurnMs: z.number().nullable(),
   avgAiTurnDurationMs: z.number().nullable(),
@@ -114,6 +120,8 @@ export async function POST(request: Request) {
           realtime_item_id: t.itemId,
           realtime_response_id: null,
           message_id: null,
+          user_turn_classification: t.classification,
+          transcription_failed: t.transcriptionFailed,
           metadata: {},
         }),
       ),
@@ -133,6 +141,8 @@ export async function POST(request: Request) {
           realtime_item_id: null,
           realtime_response_id: t.responseId,
           message_id: null,
+          user_turn_classification: null,
+          transcription_failed: null,
           metadata: {},
         }),
       ),
@@ -152,6 +162,8 @@ export async function POST(request: Request) {
           realtime_item_id: o.userItemId,
           realtime_response_id: o.aiResponseId,
           message_id: null,
+          user_turn_classification: null,
+          transcription_failed: null,
           metadata: {},
         }),
       ),
@@ -171,6 +183,8 @@ export async function POST(request: Request) {
           realtime_item_id: null,
           realtime_response_id: b.aiResponseId,
           message_id: null,
+          user_turn_classification: null,
+          transcription_failed: null,
           metadata: {},
         }),
       ),
@@ -188,6 +202,7 @@ export async function POST(request: Request) {
       total_overlap_ms: body.session.totalOverlapMs,
       overlap_count: body.session.overlapCount,
       confirmed_interruption_count: body.session.confirmedInterruptionCount,
+      suspected_noise_event_count: body.session.suspectedNoiseEventCount,
       avg_user_turn_duration_ms: body.session.avgUserTurnDurationMs,
       longest_user_turn_ms: body.session.longestUserTurnMs,
       avg_ai_turn_duration_ms: body.session.avgAiTurnDurationMs,
