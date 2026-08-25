@@ -118,8 +118,56 @@ describe("runEvaluation — evidence-integrity reject/regenerate", () => {
     expect(secondCallPrompt).toMatch(/audio or vocal evidence/i);
   });
 
-  it("rejects (throws) rather than displaying feedback if the regenerated output still violates", async () => {
+  it("sanitizes the affected field instead of rejecting when the regenerated output still violates", async () => {
+    // Production regression: rejecting the whole evaluation here meant a user who completed a
+    // session lost their entire feedback report over one leftover word in one field.
     generateEvaluation.mockResolvedValueOnce({ raw: violatingOutput() }).mockResolvedValueOnce({ raw: violatingOutput() });
+
+    const result = await runEvaluation(tool(), { scenario: scenario(), transcript: transcript(), hintCount: 0 });
+
+    expect(result).toBeDefined();
+    expect(result.overall_summary).not.toMatch(/\btone\b/i);
+    // The rest of the evaluation is untouched — sanitization only ever rewrites the offending field(s).
+    expect(result.dimensions.clarity).toEqual(cleanOutput().dimensions.clarity);
+    expect(result.next_focus).toBe(cleanOutput().next_focus);
+    expect(generateEvaluation).toHaveBeenCalledTimes(2);
+  });
+
+  it("production regression: dimensions.non_escalation.explanation contains 'tone' in both the initial generation and the retry", async () => {
+    const withNonEscalationTone = (): EvaluationLLMOutput => {
+      const output = cleanOutput();
+      output.dimensions.non_escalation.explanation = "The user's tone remained composed and non-escalatory throughout.";
+      return output;
+    };
+
+    generateEvaluation
+      .mockResolvedValueOnce({ raw: withNonEscalationTone() })
+      .mockResolvedValueOnce({ raw: withNonEscalationTone() });
+
+    const result = await runEvaluation(tool(), { scenario: scenario(), transcript: transcript(), hintCount: 0 });
+
+    // Final evaluation succeeds — runEvaluation resolves rather than throwing
+    // EvaluationValidationError, which is exactly what would otherwise surface as a 502 from
+    // /api/practice/end (see src/app/api/practice/end/route.ts's EvaluationValidationError catch).
+    expect(result).toBeDefined();
+
+    // Unsupported vocal wording is not present in the final, persisted evaluation.
+    expect(result.dimensions.non_escalation.explanation).not.toMatch(/\btone\b/i);
+    expect(result.dimensions.non_escalation.explanation).not.toMatch(/\bcalm\b/i);
+
+    // The rest of the evaluation remains intact.
+    expect(result.overall_summary).toBe(cleanOutput().overall_summary);
+    expect(result.dimensions.clarity).toEqual(cleanOutput().dimensions.clarity);
+    expect(result.dimensions.non_escalation.evidence).toBe(cleanOutput().dimensions.non_escalation.evidence);
+    expect(result.dimensions.non_escalation.score).toBe(cleanOutput().dimensions.non_escalation.score);
+    expect(result.strengths).toEqual(cleanOutput().strengths);
+    expect(result.next_focus).toBe(cleanOutput().next_focus);
+
+    expect(generateEvaluation).toHaveBeenCalledTimes(2);
+  });
+
+  it("still rejects on a genuine schema failure (unrelated to paralinguistic content)", async () => {
+    generateEvaluation.mockResolvedValueOnce({ raw: { not: "valid" } }).mockResolvedValueOnce({ raw: { still: "not valid" } });
 
     await expect(runEvaluation(tool(), { scenario: scenario(), transcript: transcript(), hintCount: 0 })).rejects.toThrow(
       EvaluationValidationError,

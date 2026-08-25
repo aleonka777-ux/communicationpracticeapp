@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { findParalinguisticViolation, VOCAL_EVIDENCE_AVAILABLE } from "@/lib/coaching/evidenceIntegrity";
+import {
+  findAllParalinguisticViolations,
+  findParalinguisticViolation,
+  sanitizeEvaluationOutput,
+  sanitizeParalinguisticText,
+  VOCAL_EVIDENCE_AVAILABLE,
+} from "@/lib/coaching/evidenceIntegrity";
 import type { EvaluationLLMOutput } from "@/lib/coaching/schema";
 
 function validOutput(overrides: Partial<EvaluationLLMOutput> = {}): EvaluationLLMOutput {
@@ -84,5 +90,106 @@ describe("findParalinguisticViolation — production regression", () => {
       overall_summary: "The user acknowledged the other person's emotion by saying \"I can see this is frustrating.\"",
     });
     expect(findParalinguisticViolation(output)).toBeNull();
+  });
+});
+
+describe("findAllParalinguisticViolations", () => {
+  it("returns every violating field, not just the first", () => {
+    const output = validOutput({
+      overall_summary: "The user maintained a respectful tone.",
+      dimensions: {
+        ...validOutput().dimensions,
+        non_escalation: { score: 4, evidence: "Did not raise their voice.", explanation: "Stayed calm." },
+      },
+    });
+    const violations = findAllParalinguisticViolations(output);
+    expect(violations).toHaveLength(3);
+    expect(violations.map((v) => v.field)).toEqual([
+      "overall_summary",
+      "dimensions.non_escalation.evidence",
+      "dimensions.non_escalation.explanation",
+    ]);
+  });
+
+  it("returns an empty array for a clean evaluation", () => {
+    expect(findAllParalinguisticViolations(validOutput())).toEqual([]);
+  });
+});
+
+describe("sanitizeParalinguisticText — meaning-preserving rewrites", () => {
+  it.each([
+    ["The user maintained a respectful tone.", "respectful wording"],
+    ["The user kept a calm tone throughout.", "non-escalatory language"],
+    ["User responded without raising their voice.", "hostile or escalating language"],
+    ["The user sounded confident when declining.", "stated their position directly"],
+  ])("rewrites %s", (input, expectedFragment) => {
+    const result = sanitizeParalinguisticText(input);
+    expect(result.toLowerCase()).toContain(expectedFragment.toLowerCase());
+    expect(findParalinguisticViolation(validOutput({ overall_summary: result }))).toBeNull();
+  });
+});
+
+describe("sanitizeEvaluationOutput", () => {
+  it("production regression: dimensions.non_escalation.explanation containing 'tone' is rewritten, not dropped", () => {
+    const output = validOutput({
+      dimensions: {
+        ...validOutput().dimensions,
+        non_escalation: {
+          score: 4,
+          evidence: "Did not use hostile language.",
+          explanation: "The user's tone remained composed and non-escalatory throughout.",
+        },
+      },
+    });
+
+    const { output: sanitizedOutput, sanitized } = sanitizeEvaluationOutput(output);
+
+    expect(findParalinguisticViolation(sanitizedOutput)).toBeNull();
+    expect(sanitizedOutput.dimensions.non_escalation.explanation).not.toMatch(/\btone\b/i);
+    expect(sanitizedOutput.dimensions.non_escalation.explanation.length).toBeGreaterThan(0);
+    expect(sanitized).toEqual([{ field: "dimensions.non_escalation.explanation", concept: "tone", method: "phrase_rewrite" }]);
+
+    // Untouched fields are byte-for-byte identical.
+    expect(sanitizedOutput.dimensions.non_escalation.evidence).toBe("Did not use hostile language.");
+    expect(sanitizedOutput.overall_summary).toBe(output.overall_summary);
+  });
+
+  it("falls back to a neutral statement when no safe rewrite exists (e.g. 'hesitation')", () => {
+    const output = validOutput({ overall_summary: "The user showed some hesitation before responding." });
+
+    const { output: sanitizedOutput, sanitized } = sanitizeEvaluationOutput(output);
+
+    expect(findParalinguisticViolation(sanitizedOutput)).toBeNull();
+    expect(sanitizedOutput.overall_summary.length).toBeGreaterThan(0);
+    expect(sanitized).toEqual([{ field: "overall_summary", concept: "hesitation", method: "neutral_fallback" }]);
+  });
+
+  it("sanitizes multiple violating fields independently, leaving everything else intact", () => {
+    const output = validOutput({
+      overall_summary: "The user maintained a respectful tone.",
+      dimensions: {
+        ...validOutput().dimensions,
+        non_escalation: { score: 4, evidence: "Did not raise their voice.", explanation: "Stayed calm." },
+      },
+    });
+
+    const { output: sanitizedOutput, sanitized } = sanitizeEvaluationOutput(output);
+
+    expect(findAllParalinguisticViolations(sanitizedOutput)).toEqual([]);
+    expect(sanitized).toHaveLength(3);
+    // A single bad set of fields never touches unrelated dimensions/strengths/next_focus.
+    expect(sanitizedOutput.dimensions.clarity).toEqual(output.dimensions.clarity);
+    expect(sanitizedOutput.strengths).toEqual(output.strengths);
+    expect(sanitizedOutput.next_focus).toBe(output.next_focus);
+  });
+
+  it("never leaves a field empty unless the schema allows it (the 'example' field only)", () => {
+    const output = validOutput({
+      improvement_areas: [
+        { issue: "Showed some hesitation.", why_it_matters: "Confidence matters.", suggestion: "Be direct.", example: "" },
+      ],
+    });
+    const { output: sanitizedOutput } = sanitizeEvaluationOutput(output);
+    expect(sanitizedOutput.improvement_areas[0].issue.length).toBeGreaterThan(0);
   });
 });

@@ -2,6 +2,25 @@
 
 Significant technical decisions and the reasoning behind them. Newest at the top.
 
+## Evidence-integrity recovery, round 3: sanitize the field, don't reject the whole evaluation
+
+Production confirmed the round-2 code-level validator was correctly *catching* violations, but its recovery strategy was too destructive: `dimensions.non_escalation.explanation` contained "tone," the one regenerate attempt still contained "tone," and the whole evaluation was rejected — `/api/practice/end` returned 502 and a user who had completed a real session lost their entire feedback report over one leftover word in one field. The detection logic itself was not weakened at all; only what happens after a violation survives regeneration changed.
+
+**New recovery order in `runEvaluation`** (`src/lib/coaching/evaluationEngine.ts`):
+1. Generate normally; validate schema (unchanged: one retry, then a genuine throw — this path is untouched, since a schema failure is a different, real problem).
+2. Scan **every** text field for a paralinguistic claim (`findAllParalinguisticViolations`, new — the old `findParalinguisticViolation` returned only the first match, which was enough to trigger a retry but not enough to know what still needs fixing afterward).
+3. If any exist, regenerate the whole evaluation once, same as before.
+4. If the regenerated result *still* has violations (or itself fails schema validation, in which case the original — still schema-valid — result is used instead of discarding everything), **sanitize only the offending field(s)** rather than throwing.
+5. Re-validate the sanitized object against the zod schema as a final safety net (should always pass, since sanitization only ever replaces a string within its own length limit) — a genuine last-resort throw stays reachable in principle, but only if sanitization itself somehow produced invalid output, never merely because a paralinguistic word was present.
+
+**The sanitizer** (`src/lib/coaching/evidenceIntegrity.ts`, `sanitizeEvaluationOutput` + `sanitizeParalinguisticText`), per field:
+- Try an ordered set of meaning-preserving phrase rewrites first — most specific idiom first, generic word-level fallback last, each rule operating on the previous rule's output: `"respectful tone"` → `"respectful wording"`, `"calm tone"`/`"calm demeanor"` → `"non-escalatory language"`, `"didn't raise their voice"` → `"did not use hostile or escalating language"`, `"sounded confident"` → `"stated their position directly"`, and generic `"<adjective> tone"` → `"<adjective> wording"`, bare `tone`/`voice`/`demeanor`/`volume`/`pace` → `wording`, `calm(ly/ness)` → `non-escalatory`, `vocal` → `verbal`.
+- Re-check the rewritten text against the same violation patterns. If it's clean and still fits the field's schema length limit, use it — the original coaching point is preserved, just reworded onto transcript-safe ground.
+- If no safe rewrite exists (e.g. "hesitation," "emotional state," or an unrecognized "sounded X" — concepts with no clean transcript-based equivalent, where a naive word swap risks inverting the meaning) or the rewrite doesn't fit the length limit, that one field — and only that field — is replaced with a short, generic, always-valid, transcript-grounded statement (e.g. "This reflects the wording used, not any assumed delivery."). Every other field, including the rest of the same dimension, is untouched.
+- Every sanitized field is logged (`concept`, `method: "phrase_rewrite" | "neutral_fallback"`) alongside the original violation log, so production visibility into what's being caught and how it's being fixed is unchanged.
+
+No rubric, scoring, methodology, or feedback-layout change — this only changes what happens to the *wording* of one field when the model still gets it wrong after one retry. No vocal analytics were added.
+
 ## Acoustic echo causing false Realtime interruptions: client-controlled barge-in confirmation
 
 Production symptom without headphones: the AI's speech would suddenly stop and the UI would flip to Listening with no one having spoken; the same conversation over headphones never false-triggered even once. That contrast is the smoking gun for acoustic echo — the AI's own speaker output leaking into the microphone and registering as a `speech_started` VAD event.
