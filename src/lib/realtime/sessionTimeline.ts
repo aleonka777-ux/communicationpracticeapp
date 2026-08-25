@@ -28,6 +28,21 @@
  * - AI turn outcome: `response.done`'s `response.status` (`completed`/`cancelled`/`failed`/
  *   `incomplete`) — the server's own authoritative record of whether a turn was cut short.
  *
+ * The response.created -> output_audio_buffer.started gap: `bargeIn.ts` deliberately treats the AI
+ * as "speaking" from `response.created` onward (see its own doc comment — this closes a real
+ * media/data-channel ordering race), which is EARLIER than this module's own AiTurnMetric interval
+ * (`output_audio_buffer.started` -> `.stopped`, i.e. actual audio playback). A confirmed barge-in
+ * can therefore legitimately land in the gap between the two: the server had started generating a
+ * response but had not yet produced any audio for it when the user was confirmed to have started
+ * talking over it. In that case there is genuinely no audio to have overlapped with — 0 overlap is
+ * the CORRECT answer, not a bug — but the confirmation must still be attributable to the response
+ * it interrupted rather than silently recording a null aiResponseId. `recordResponseCreated()`
+ * tracks this pending (created-but-not-yet-playing) response specifically so
+ * `recordConfirmedBargeIn()` can fall back to it when no AiTurnMetric interval exists yet; no
+ * AiTurnMetric row is created for a response that never produced audio, since a "turn" here
+ * specifically means a period of actual playback (creating one would misrepresent AI speaking time
+ * with a phantom zero-duration turn).
+ *
  * User-speech-event classification: a raw `speech_started` -> `speech_stopped` pair is NOT by
  * itself evidence that a real user communication turn occurred — production testing has confirmed
  * false `speech_started` events from speaker echo. Every such event is classified as either
@@ -180,6 +195,9 @@ export interface SessionTimeline {
    *  a completion event at all. */
   recordUserTranscript(itemId: string, transcript: string): void;
   recordUserTranscriptionFailed(itemId: string): void;
+  /** A response has been created (generation started) but has not necessarily produced any audio
+   *  yet — see the module doc comment on the response.created -> output_audio_buffer.started gap. */
+  recordResponseCreated(responseId: string): void;
   recordAiAudioStarted(responseId: string): void;
   recordAiAudioStopped(responseId: string): void;
   recordAiTranscript(responseId: string, transcript: string): void;
@@ -234,6 +252,10 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
   const confirmedBargeIns: ConfirmedBargeInMetric[] = [];
   const responseCancellations: ResponseCancelledMetric[] = [];
   let currentAiResponseId: string | null = null;
+  /** A response that has received response.created but not yet output_audio_buffer.started — see
+   *  the module doc comment on the response.created -> output_audio_buffer.started gap. Cleared
+   *  once that response either starts producing audio or concludes without ever doing so. */
+  let pendingResponseId: string | null = null;
   /** The user turn currently open (speech_started received, speech_stopped not yet), if any — a
    *  confirmed barge-in can only ever fire while this is set (see bargeIn.ts: a blip that stops
    *  before confirmation never reaches onConfirmedBargeIn), so this is how recordConfirmedBargeIn()
@@ -275,7 +297,12 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
       if (turn) turn.transcriptionFailed = true;
     },
 
+    recordResponseCreated(responseId) {
+      pendingResponseId = responseId;
+    },
+
     recordAiAudioStarted(responseId) {
+      if (pendingResponseId === responseId) pendingResponseId = null;
       if (aiTurnsByResponseId.has(responseId)) return;
       aiTurnsByResponseId.set(responseId, {
         turnIndex: aiTurnOrder.length + 1,
@@ -303,6 +330,7 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
     },
 
     recordResponseDone(responseId, status) {
+      if (pendingResponseId === responseId) pendingResponseId = null;
       const turn = aiTurnsByResponseId.get(responseId);
       if (!turn) return;
       turn.responseStatus = status;
@@ -310,7 +338,12 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
     },
 
     recordConfirmedBargeIn() {
-      confirmedBargeIns.push({ atMs: elapsed(), aiResponseId: currentAiResponseId });
+      // Prefer the response actively producing audio; if none is playing yet, fall back to one
+      // that has been created but hasn't started playing — see the module doc comment on the
+      // response.created -> output_audio_buffer.started gap. This is attribution only: no
+      // AiTurnMetric is fabricated for a response that never produced audio.
+      const interruptedResponseId = currentAiResponseId ?? pendingResponseId;
+      confirmedBargeIns.push({ atMs: elapsed(), aiResponseId: interruptedResponseId });
       const aiTurn = currentAiResponseId ? aiTurnsByResponseId.get(currentAiResponseId) : null;
       if (aiTurn) aiTurn.wasInterrupted = true;
       // A confirmed barge-in can only ever fire while the triggering user turn is still open (see

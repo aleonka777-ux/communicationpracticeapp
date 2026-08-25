@@ -373,7 +373,7 @@ export function RealtimeSimulationClient({
               aiAudioSpeechIncidentRef.current = null;
               console.error("[voice:realtime] user speech transcription failed (turn continues)", event.error);
               break;
-            case "response.created":
+            case "response.created": {
               // Fires before ANY audio (see the doc comment in bargeIn.ts) — marking the AI as
               // "speaking" here, not only once output_audio_buffer.started arrives, closes a real
               // gap: media (SRTP) and data-channel events aren't guaranteed to be processed in
@@ -382,7 +382,13 @@ export function RealtimeSimulationClient({
               // would bypass the confirmation window entirely.
               logRealtimeDebugEvent(sessionId, "ai_response_created", { isFirstAiResponse: isFirstAiResponseRef.current });
               bargeIn.handleAiSpeakingChanged(true);
+              // Lets a confirmed barge-in that lands before this response ever produces audio
+              // still be attributed to it instead of recording a null aiResponseId — see
+              // sessionTimeline.ts's doc comment on this exact gap.
+              const responseId = (event.response as { id?: string } | undefined)?.id;
+              if (responseId) metricsRef.current?.recordResponseCreated(responseId);
               break;
+            }
             case "response.done": {
               // Always emitted, regardless of outcome (completed/cancelled/failed) — the reliable
               // backstop for clearing "AI is speaking" even if a response never actually produced

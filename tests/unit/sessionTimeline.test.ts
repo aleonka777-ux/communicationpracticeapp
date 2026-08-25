@@ -463,3 +463,141 @@ describe("createSessionTimeline", () => {
     expect(serialized).not.toMatch(/data:audio/);
   });
 });
+
+/**
+ * Regression coverage for a production measurement-integrity report: a session with
+ * confirmed_interruption_count=1 but overlap_count=0/total_overlap_ms=0. Root cause: bargeIn.ts
+ * treats the AI as "speaking" from response.created onward (to close a media/data-channel
+ * ordering race — see its own doc comment), which is EARLIER than this module's own AiTurnMetric
+ * interval (output_audio_buffer.started -> .stopped, i.e. actual audio playback). A confirmed
+ * barge-in can fire in the gap between the two — the server had started generating a response but
+ * had not yet produced any audio for it — in which case 0 overlap is correct (nothing was ever
+ * playing to overlap with), but recordConfirmedBargeIn() was attributing it to a null aiResponseId
+ * instead of the response actually being interrupted. Fixed with recordResponseCreated(), tracked
+ * separately from the actual-playback AiTurnMetric interval.
+ */
+describe("createSessionTimeline — confirmed barge-in during active AI playback (the normal case)", () => {
+  it("user begins speaking while AI playback is active, barge-in confirms at 250ms, AI is cancelled, and overlap reflects the actual simultaneous-speech interval", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    // A response is created, then its audio actually starts playing.
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(300); // model generation latency before audio starts
+    timeline.recordAiAudioStarted("resp_1");
+
+    // 1s into playback, the user begins speaking over it.
+    clock.advance(1000);
+    timeline.recordUserSpeechStarted("item_1");
+
+    // Barge-in confirms after the standard 250ms confirmation window, AI audio is cancelled.
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+    timeline.recordResponseCancelled("resp_1", "confirmed_bargein");
+
+    // Whatever was already buffered keeps playing briefly before output_audio_buffer.stopped fires.
+    clock.advance(80);
+    timeline.recordAiAudioStopped("resp_1");
+    timeline.recordResponseDone("resp_1", "cancelled");
+
+    // The user keeps talking a bit longer after the AI actually stops.
+    clock.advance(400);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Wait, let me stop you there.");
+
+    const snapshot = timeline.finalize();
+
+    expect(snapshot.session.confirmedInterruptionCount).toBe(1);
+    expect(snapshot.confirmedBargeIns[0].aiResponseId).toBe("resp_1");
+
+    expect(snapshot.aiTurns).toHaveLength(1);
+    expect(snapshot.aiTurns[0].wasInterrupted).toBe(true);
+    expect(snapshot.aiTurns[0].responseStatus).toBe("cancelled");
+
+    // Overlap window: from when the user started (1300ms) to when AI audio actually stopped
+    // (1630ms) — the real simultaneous-speech interval, not the whole user turn.
+    expect(snapshot.overlaps).toHaveLength(1);
+    expect(snapshot.overlaps[0].startMs).toBe(1300);
+    expect(snapshot.overlaps[0].endMs).toBe(1630);
+    expect(snapshot.overlaps[0].durationMs).toBe(330);
+    expect(snapshot.session.overlapCount).toBe(1);
+    expect(snapshot.session.totalOverlapMs).toBe(330);
+
+    // One confirmed interruption, one overlap interval — not double-counted in either direction.
+    expect(snapshot.session.confirmedInterruptionCount).toBe(1);
+    expect(snapshot.session.overlapCount).toBe(1);
+  });
+});
+
+describe("createSessionTimeline — confirmed barge-in in the response.created-to-audio-start gap", () => {
+  it("attributes the confirmed barge-in to the pending response instead of a null aiResponseId, with correct zero overlap since no audio ever played", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    // A prior AI turn finishes completely and naturally.
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(200);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(1000);
+    timeline.recordAiAudioStopped("resp_1");
+    timeline.recordResponseDone("resp_1", "completed");
+
+    // The server starts generating the NEXT response (create_response: true), but before it ever
+    // produces a byte of audio, the user starts talking again.
+    clock.advance(50);
+    timeline.recordResponseCreated("resp_2");
+    clock.advance(80);
+    timeline.recordUserSpeechStarted("item_1");
+
+    // Sustained past the confirmation window -> confirmed barge-in, even though resp_2's audio
+    // never started (currentAiResponseId is null at this point).
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+    timeline.recordResponseCancelled("resp_2", "confirmed_bargein");
+    timeline.recordResponseDone("resp_2", "cancelled"); // resp_2 concludes having never played audio
+
+    clock.advance(500);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Actually, hold on.");
+
+    const snapshot = timeline.finalize();
+
+    // Attribution fixed: the confirmed barge-in points at the response it actually interrupted.
+    expect(snapshot.session.confirmedInterruptionCount).toBe(1);
+    expect(snapshot.confirmedBargeIns[0].aiResponseId).toBe("resp_2");
+
+    // No phantom AiTurnMetric is fabricated for a response that never produced audio — only the
+    // one real, completed AI turn exists.
+    expect(snapshot.aiTurns).toHaveLength(1);
+    expect(snapshot.aiTurns[0].responseId).toBe("resp_1");
+    expect(snapshot.aiTurns[0].wasInterrupted).toBe(false);
+
+    // Zero overlap is CORRECT here — no audio was ever playing to overlap with — not a bug.
+    expect(snapshot.overlaps).toHaveLength(0);
+    expect(snapshot.session.overlapCount).toBe(0);
+    expect(snapshot.session.totalOverlapMs).toBe(0);
+
+    // The interrupting user turn is still a real, confirmed turn.
+    expect(snapshot.userTurns).toHaveLength(1);
+    expect(snapshot.userTurns[0].classification).toBe("confirmed");
+  });
+
+  it("does not leave a stale pending response id attributed to a later, unrelated confirmed barge-in", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    // resp_1 is created and starts playing normally — pendingResponseId should clear.
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(100);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(500);
+    // A later confirmed barge-in against resp_1 while it's actively playing must attribute to
+    // resp_1 itself, not resurface the already-cleared pending id.
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.confirmedBargeIns[0].aiResponseId).toBe("resp_1");
+  });
+});
