@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createBargeInController, DEFAULT_BARGE_IN_CONFIRM_MS } from "@/lib/realtime/bargeIn";
+import { createBargeInController, DEFAULT_BARGE_IN_CONFIRM_MS, type BargeInControllerOptions } from "@/lib/realtime/bargeIn";
 
 /**
  * Deterministic manual scheduler — bargeIn.ts only ever has one active timer at a time (a new
@@ -28,7 +28,10 @@ function createManualScheduler() {
   };
 }
 
-function buildController(scheduler: ReturnType<typeof createManualScheduler>) {
+function buildController(
+  scheduler: ReturnType<typeof createManualScheduler>,
+  extra?: Partial<BargeInControllerOptions>,
+) {
   const onImmediateSpeechStart = vi.fn();
   const onConfirmedBargeIn = vi.fn();
   const onSpeechStoppedAfterReport = vi.fn();
@@ -38,6 +41,7 @@ function buildController(scheduler: ReturnType<typeof createManualScheduler>) {
     onSpeechStoppedAfterReport,
     setTimer: scheduler.setTimer,
     clearTimer: scheduler.clearTimer,
+    ...extra,
   });
   return { controller, onImmediateSpeechStart, onConfirmedBargeIn, onSpeechStoppedAfterReport };
 }
@@ -145,5 +149,111 @@ describe("createBargeInController", () => {
 
     expect(scheduler.clearTimer.mock.calls.length).toBeGreaterThan(firstClearCalls);
     expect(scheduler.isScheduled()).toBe(true); // exactly one still active, not two
+  });
+
+  describe("confirmMs as a function — supports a widened startup-only confirmation window", () => {
+    it("resolves confirmMs fresh on every speech_started, not once at construction", () => {
+      const scheduler = createManualScheduler();
+      let isFirstAiResponse = true;
+      const confirmMs = vi.fn(() => (isFirstAiResponse ? 500 : DEFAULT_BARGE_IN_CONFIRM_MS));
+      const { controller } = buildController(scheduler, { confirmMs });
+
+      controller.handleAiSpeakingChanged(true);
+      controller.handleSpeechStarted();
+      expect(scheduler.scheduledMs()).toBe(500);
+      scheduler.fire();
+      controller.handleSpeechStopped();
+
+      // The first AI response has now finished — later turns should use the normal window.
+      isFirstAiResponse = false;
+      controller.handleAiSpeakingChanged(true);
+      controller.handleSpeechStarted();
+      expect(scheduler.scheduledMs()).toBe(DEFAULT_BARGE_IN_CONFIRM_MS);
+    });
+
+    it("a short startup echo/VAD blip during the first AI response does NOT cancel the AI, even with the widened window", () => {
+      const scheduler = createManualScheduler();
+      const { controller, onConfirmedBargeIn, onImmediateSpeechStart } = buildController(scheduler, { confirmMs: () => 500 });
+
+      controller.handleAiSpeakingChanged(true);
+      controller.handleSpeechStarted();
+      expect(scheduler.scheduledMs()).toBe(500);
+
+      // Stops well within the widened window, exactly like a click/breath/echo tail would.
+      controller.handleSpeechStopped();
+
+      expect(onConfirmedBargeIn).not.toHaveBeenCalled();
+      expect(onImmediateSpeechStart).not.toHaveBeenCalled();
+      expect(scheduler.isScheduled()).toBe(false);
+    });
+
+    it("real sustained user speech during the first AI response still interrupts it, just after the wider window", () => {
+      const scheduler = createManualScheduler();
+      const { controller, onConfirmedBargeIn } = buildController(scheduler, { confirmMs: () => 500 });
+
+      controller.handleAiSpeakingChanged(true);
+      controller.handleSpeechStarted();
+      scheduler.fire(); // the full 500ms elapses while speech is still ongoing
+
+      expect(onConfirmedBargeIn).toHaveBeenCalledTimes(1);
+    });
+
+    it("later-session genuine barge-in behavior is unaffected by the startup window having existed earlier", () => {
+      const scheduler = createManualScheduler();
+      let isFirstAiResponse = true;
+      const { controller, onConfirmedBargeIn } = buildController(scheduler, {
+        confirmMs: () => (isFirstAiResponse ? 500 : DEFAULT_BARGE_IN_CONFIRM_MS),
+      });
+
+      // First (startup) turn: a blip, correctly not interrupted.
+      controller.handleAiSpeakingChanged(true);
+      controller.handleSpeechStarted();
+      controller.handleSpeechStopped();
+      controller.handleAiSpeakingChanged(false);
+      isFirstAiResponse = false;
+
+      // Later turn: sustained speech interrupts using the normal (shorter) window, unchanged.
+      controller.handleAiSpeakingChanged(true);
+      controller.handleSpeechStarted();
+      expect(scheduler.scheduledMs()).toBe(DEFAULT_BARGE_IN_CONFIRM_MS);
+      scheduler.fire();
+      expect(onConfirmedBargeIn).toHaveBeenCalledTimes(1);
+    });
+
+    it("repeated short startup blips cannot accumulate into a confirmed barge-in", () => {
+      const scheduler = createManualScheduler();
+      const { controller, onConfirmedBargeIn } = buildController(scheduler, { confirmMs: () => 500 });
+
+      controller.handleAiSpeakingChanged(true);
+      for (let i = 0; i < 5; i++) {
+        controller.handleSpeechStarted();
+        expect(scheduler.scheduledMs()).toBe(500); // each blip gets a fresh, full window — never shortened
+        controller.handleSpeechStopped();
+      }
+
+      expect(onConfirmedBargeIn).not.toHaveBeenCalled();
+      expect(scheduler.isScheduled()).toBe(false);
+    });
+
+    it("no stale confirmation timer survives speech_stopped, reset, or the AI response completing", () => {
+      const scheduler = createManualScheduler();
+      const { controller: a } = buildController(scheduler, { confirmMs: () => 500 });
+      a.handleAiSpeakingChanged(true);
+      a.handleSpeechStarted();
+      a.handleSpeechStopped();
+      expect(scheduler.isScheduled()).toBe(false);
+
+      const { controller: b } = buildController(scheduler, { confirmMs: () => 500 });
+      b.handleAiSpeakingChanged(true);
+      b.handleSpeechStarted();
+      b.reset();
+      expect(scheduler.isScheduled()).toBe(false);
+
+      const { controller: c } = buildController(scheduler, { confirmMs: () => 500 });
+      c.handleAiSpeakingChanged(true);
+      c.handleSpeechStarted();
+      c.handleAiSpeakingChanged(false); // AI response completes mid-confirmation
+      expect(scheduler.isScheduled()).toBe(false);
+    });
   });
 });

@@ -12,6 +12,8 @@
  * which contains only device capability flags/numbers, not audio).
  */
 export type RealtimeDebugEvent =
+  | "ai_response_created"
+  | "ai_response_done"
   | "ai_audio_started"
   | "ai_audio_completed"
   | "speech_started"

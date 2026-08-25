@@ -15,13 +15,30 @@
  *
  * When the AI is NOT speaking, there is nothing to protect against echo of (nothing playing to
  * leak back), so ordinary turn-taking is reported immediately with no delay.
+ *
+ * `handleAiSpeakingChanged(true)` should be called as soon as a response is known to be starting
+ * (OpenAI's `response.created`, which precedes any audio), not only once audio actually begins
+ * (`output_audio_buffer.started`) — the two are not guaranteed to be processed in the same order
+ * a client receives them (media flows over SRTP, events over the data channel), and a gap where
+ * this controller still believes the AI isn't speaking yet would let an echo-triggered
+ * `speech_started` through with zero confirmation delay. This matters most for the very first AI
+ * turn: it is also the turn where the browser's echo-cancellation adaptive filter has had the
+ * least time to converge against the newly-started output, so it's the turn most likely to
+ * produce a stray VAD trigger in the first place. See realtime-simulation-client.tsx for the
+ * startup-specific widened confirmation window this enables.
  */
 
 export const DEFAULT_BARGE_IN_CONFIRM_MS = 250;
 
 export interface BargeInControllerOptions {
-  /** How long speech must persist while the AI is speaking before it's treated as genuine barge-in. */
-  confirmMs?: number;
+  /**
+   * How long speech must persist while the AI is speaking before it's treated as genuine
+   * barge-in. A function is evaluated fresh on every speech_started, so a caller can widen the
+   * window for a specific known-riskier window (e.g. the first AI turn, before the browser's
+   * echo-cancellation adaptive filter has converged against the newly-started output) without
+   * changing the value used everywhere else in the conversation.
+   */
+  confirmMs?: number | (() => number);
   /** AI was not speaking — this is ordinary turn-taking, report speech-started immediately. */
   onImmediateSpeechStart: () => void;
   /** Speech persisted through the confirmation window while the AI was speaking — genuine barge-in. */
@@ -47,7 +64,8 @@ export interface BargeInController {
 }
 
 export function createBargeInController(options: BargeInControllerOptions): BargeInController {
-  const confirmMs = options.confirmMs ?? DEFAULT_BARGE_IN_CONFIRM_MS;
+  const confirmMsOption = options.confirmMs ?? DEFAULT_BARGE_IN_CONFIRM_MS;
+  const resolveConfirmMs = () => (typeof confirmMsOption === "function" ? confirmMsOption() : confirmMsOption);
   const setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
   const clearTimer = options.clearTimer ?? ((id) => clearTimeout(id));
 
@@ -92,7 +110,7 @@ export function createBargeInController(options: BargeInControllerOptions): Barg
         pendingTimer = null;
         reported = true;
         options.onConfirmedBargeIn();
-      }, confirmMs);
+      }, resolveConfirmMs());
     },
 
     handleSpeechStopped() {

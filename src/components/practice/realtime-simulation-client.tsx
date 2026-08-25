@@ -15,10 +15,22 @@ import { connectRealtimeSession, type RealtimeConnection } from "@/lib/realtime/
 import { waitForPendingUserTranscription } from "@/lib/realtime/pendingTranscription";
 import { waitForCurrentExchangeToFinish } from "@/lib/realtime/exchangeCompletion";
 import { logFinalizationStage } from "@/lib/realtime/finalizationLog";
-import { createBargeInController } from "@/lib/realtime/bargeIn";
+import { createBargeInController, DEFAULT_BARGE_IN_CONFIRM_MS } from "@/lib/realtime/bargeIn";
 import { logRealtimeDebugEvent } from "@/lib/realtime/debugLog";
 
 const NAVIGATION_STALL_TIMEOUT_MS = 8000;
+
+/**
+ * Widened barge-in confirmation used only for the AI's first turn (the opening line). Production
+ * evidence: false interruptions over speakers clustered at the very start of the conversation and
+ * disappeared afterward — consistent with the browser's echo-cancellation adaptive filter not
+ * having converged yet against newly-started output (it has nothing to adapt against until
+ * output actually begins), and/or a freshly-opened data channel being more prone to brief
+ * delivery jitter than a warmed-up one. Both point at the same fix: give the FIRST turn specifically
+ * more tolerance before treating a VAD start as genuine speech, without touching the VAD threshold
+ * (still 0.6, unchanged) or the normal 250ms window used for the rest of the conversation.
+ */
+const STARTUP_BARGE_IN_CONFIRM_MS = 500;
 
 export interface RealtimeSimulationClientProps {
   sessionId: string;
@@ -72,7 +84,19 @@ export function RealtimeSimulationClient({
   const stateRef = useRef<RealtimeConnectionState>(state);
   const navigationStartedAtRef = useRef<number | null>(null);
   /** Diagnostics only, for telling a real barge-in apart from echo/noise — see debugLog.ts. */
-  const aiAudioSpeechIncidentRef = useRef<{ startedAt: number; wasInterrupted: boolean } | null>(null);
+  const aiAudioSpeechIncidentRef = useRef<{
+    startedAt: number;
+    wasInterrupted: boolean;
+    isFirstAiResponse: boolean;
+    confirmMsUsed: number;
+    sessionElapsedMs: number;
+    sinceFirstAiAudioMs: number | null;
+  } | null>(null);
+  /** True until the AI's first turn (the opening line) finishes — see STARTUP_BARGE_IN_CONFIRM_MS. */
+  const isFirstAiResponseRef = useRef(true);
+  const sessionMountedAtRef = useRef(Date.now());
+  const firstAiAudioStartAtRef = useRef<number | null>(null);
+  const micSettingsRef = useRef<MediaTrackSettings | null>(null);
 
   useEffect(() => {
     stateRef.current = state;
@@ -165,6 +189,11 @@ export function RealtimeSimulationClient({
     openingLineSentRef.current = false;
     openingLineTranscriptSkippedRef.current = false;
     pendingUserTranscriptionRef.current = false;
+    // A genuine reconnect restarts the audio pipeline from scratch (fresh WebRTC connection, echo
+    // cancellation re-adapting against newly-started output), so the startup-specific protection
+    // applies again, not just on the very first connection attempt of the session.
+    isFirstAiResponseRef.current = true;
+    firstAiAudioStartAtRef.current = null;
 
     try {
       const { clientSecret, openingLine } = await postJson<{ clientSecret: string; openingLine: string }>(
@@ -177,6 +206,7 @@ export function RealtimeSimulationClient({
       // is exactly the acoustic-echo failure mode reported in production, so this only treats it
       // as genuine barge-in once speech has persisted for a short confirmation window.
       const bargeIn = createBargeInController({
+        confirmMs: () => (isFirstAiResponseRef.current ? STARTUP_BARGE_IN_CONFIRM_MS : DEFAULT_BARGE_IN_CONFIRM_MS),
         onImmediateSpeechStart: () => {
           dispatch({ type: "USER_STARTED_SPEAKING" });
         },
@@ -197,6 +227,7 @@ export function RealtimeSimulationClient({
           if (remoteAudioRef.current) remoteAudioRef.current.srcObject = stream;
         },
         onMicTrackSettings: (settings) => {
+          micSettingsRef.current = settings;
           logRealtimeDebugEvent(sessionId, "mic_track_settings", { settings });
         },
         onConnectionStateChange: (pcState) => {
@@ -234,8 +265,23 @@ export function RealtimeSimulationClient({
             }
             case "input_audio_buffer.speech_started": {
               const aiWasSpeaking = stateRef.current === "speaking";
-              logRealtimeDebugEvent(sessionId, "speech_started", { uiState: stateRef.current, aiAudioPlaying: aiWasSpeaking });
-              aiAudioSpeechIncidentRef.current = aiWasSpeaking ? { startedAt: Date.now(), wasInterrupted: false } : null;
+              const isFirst = isFirstAiResponseRef.current;
+              logRealtimeDebugEvent(sessionId, "speech_started", {
+                uiState: stateRef.current,
+                aiAudioPlaying: aiWasSpeaking,
+                isFirstAiResponse: isFirst,
+                sessionElapsedMs: Date.now() - sessionMountedAtRef.current,
+              });
+              aiAudioSpeechIncidentRef.current = aiWasSpeaking
+                ? {
+                    startedAt: Date.now(),
+                    wasInterrupted: false,
+                    isFirstAiResponse: isFirst,
+                    confirmMsUsed: isFirst ? STARTUP_BARGE_IN_CONFIRM_MS : DEFAULT_BARGE_IN_CONFIRM_MS,
+                    sessionElapsedMs: Date.now() - sessionMountedAtRef.current,
+                    sinceFirstAiAudioMs: firstAiAudioStartAtRef.current ? Date.now() - firstAiAudioStartAtRef.current : null,
+                  }
+                : null;
               bargeIn.handleSpeechStarted();
               break;
             }
@@ -246,6 +292,12 @@ export function RealtimeSimulationClient({
                 logRealtimeDebugEvent(sessionId, "speech_started_during_ai_audio", {
                   durationMs: Date.now() - incident.startedAt,
                   wasInterrupted: incident.wasInterrupted,
+                  isFirstAiResponse: incident.isFirstAiResponse,
+                  confirmMsUsed: incident.confirmMsUsed,
+                  sessionElapsedMs: incident.sessionElapsedMs,
+                  sinceFirstAiAudioMs: incident.sinceFirstAiAudioMs,
+                  // Only worth the extra log volume for the one turn we're actually diagnosing.
+                  micSettings: incident.isFirstAiResponse ? micSettingsRef.current : undefined,
                 });
               }
               bargeIn.handleSpeechStopped();
@@ -257,6 +309,7 @@ export function RealtimeSimulationClient({
               logRealtimeDebugEvent(sessionId, "user_transcription_completed", {
                 hasMeaningfulTranscript: transcript.length > 0,
                 followsSpeechDuringAiAudio: aiAudioSpeechIncidentRef.current !== null,
+                isFirstAiResponse: aiAudioSpeechIncidentRef.current?.isFirstAiResponse ?? false,
               });
               aiAudioSpeechIncidentRef.current = null;
               if (transcript) void enqueueTranscript("user", transcript);
@@ -266,19 +319,44 @@ export function RealtimeSimulationClient({
               pendingUserTranscriptionRef.current = false;
               logRealtimeDebugEvent(sessionId, "user_transcription_failed", {
                 followsSpeechDuringAiAudio: aiAudioSpeechIncidentRef.current !== null,
+                isFirstAiResponse: aiAudioSpeechIncidentRef.current?.isFirstAiResponse ?? false,
               });
               aiAudioSpeechIncidentRef.current = null;
               console.error("[voice:realtime] user speech transcription failed (turn continues)", event.error);
               break;
+            case "response.created":
+              // Fires before ANY audio (see the doc comment in bargeIn.ts) — marking the AI as
+              // "speaking" here, not only once output_audio_buffer.started arrives, closes a real
+              // gap: media (SRTP) and data-channel events aren't guaranteed to be processed in
+              // the same order, so audio could otherwise start reaching the speaker fractionally
+              // before our own state caught up, during which an echo-triggered speech_started
+              // would bypass the confirmation window entirely.
+              logRealtimeDebugEvent(sessionId, "ai_response_created", { isFirstAiResponse: isFirstAiResponseRef.current });
+              bargeIn.handleAiSpeakingChanged(true);
+              break;
+            case "response.done":
+              // Always emitted, regardless of outcome (completed/cancelled/failed) — the reliable
+              // backstop for clearing "AI is speaking" even if a response never actually produced
+              // any audio at all, so this flag can never get stuck true from response.created above.
+              logRealtimeDebugEvent(sessionId, "ai_response_done", { isFirstAiResponse: isFirstAiResponseRef.current });
+              bargeIn.handleAiSpeakingChanged(false);
+              break;
             case "output_audio_buffer.started":
-              logRealtimeDebugEvent(sessionId, "ai_audio_started");
+              if (firstAiAudioStartAtRef.current === null) firstAiAudioStartAtRef.current = Date.now();
+              logRealtimeDebugEvent(sessionId, "ai_audio_started", {
+                isFirstAiResponse: isFirstAiResponseRef.current,
+                sessionElapsedMs: Date.now() - sessionMountedAtRef.current,
+              });
               bargeIn.handleAiSpeakingChanged(true);
               dispatch({ type: "AI_STARTED_SPEAKING" });
               break;
             case "output_audio_buffer.stopped":
-              logRealtimeDebugEvent(sessionId, "ai_audio_completed");
+              logRealtimeDebugEvent(sessionId, "ai_audio_completed", { isFirstAiResponse: isFirstAiResponseRef.current });
               bargeIn.handleAiSpeakingChanged(false);
               dispatch({ type: "AI_FINISHED_SPEAKING" });
+              // The startup-specific protection only ever applies to this one, first AI turn —
+              // every turn after it reverts to the normal, shorter confirmation window.
+              isFirstAiResponseRef.current = false;
               break;
             case "response.output_audio_transcript.done": {
               // The very first AI turn is the scenario's opening line, already persisted at
