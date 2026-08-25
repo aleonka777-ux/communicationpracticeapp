@@ -107,6 +107,56 @@
  * id is also what gets marked `wasInterrupted` on the AI turn side, and what overlap/latency
  * ultimately reconcile against, so every derived signal agrees on the same moment-in-time answer.
  *
+ * The media/data-channel ordering race, part two — WebRTC media (SRTP, carries the actual audio
+ * samples) and the Realtime data channel (SCTP, carries `output_audio_buffer.started`) are two
+ * different transports multiplexed over the same ICE/DTLS connection, with no guaranteed relative
+ * ordering (this is the same class of race `bargeIn.ts` already accounts for between
+ * `response.created` and audio reaching the speaker — see its own doc comment). Snapshotting
+ * `currentAiResponseId` at `input_audio_buffer.speech_started` time (above) fixes "state moved on
+ * by confirmation time," but is still vulnerable to a narrower version of the same race: if the
+ * actual audio for a response reaches the user's speakers moments BEFORE the data channel's
+ * `output_audio_buffer.started` for that same response has been processed, the user can genuinely
+ * already be hearing the AI when they start talking, yet `currentAiResponseId` is still `null` at
+ * the exact instant `recordUserSpeechStarted()` snapshots it.
+ *
+ * A real HTMLMediaElement (`<audio>`, fed by `ontrack`) exists client-side and does expose genuine
+ * playback signals (`playing`/`waiting`/`pause`) — these were audited as a candidate authoritative
+ * "audio is rendering right now" source. They are not usable here: OpenAI's output track is a
+ * single continuous live MediaStream reused across every AI turn in the session, not a discrete
+ * file/clip per turn, so the element's `readyState`/`playing`/`waiting` transitions track *network/
+ * buffering* health for the whole connection, not per-turn silence between AI responses (the track
+ * keeps flowing, silent or not, between turns) — using them would not distinguish "response N's
+ * audio is playing" from "the pipe is merely idle." Detecting genuine silence directly would require
+ * inspecting decoded audio sample energy (Web Audio API `AnalyserNode`), which is vocal/audio-level
+ * analysis, explicitly out of scope for this measurement layer.
+ *
+ * With no stronger signal available, this is resolved with a small, explicitly bounded, documented
+ * reconciliation instead of either extreme (treating every `response.created` as audible — which
+ * would defeat the whole `response.created` -> `.started` gap analysis above, per the module's own
+ * "we do NOT want to classify all response.created -> speech events as audible" requirement — or
+ * trusting the at-start snapshot unconditionally). If a candidate interruption's AI state at
+ * speech-start was `"pre_playback"` (a response was pending but not yet marked playing), and that
+ * SAME response's `output_audio_buffer.started` is later found to have landed within
+ * `MEDIA_DATA_CHANNEL_SKEW_TOLERANCE_MS` AFTER the user's speech began, the two transports are
+ * treated as reporting the same real-world event a few ms apart, and the interruption is reclassified
+ * `"audible"`. This reconciliation can only run at `finalize()` time, once the full timeline
+ * (including any `.started` that arrived shortly after speech began) is known — `recordConfirmedBargeIn()`
+ * therefore records the raw evidence (the at-start snapshot, plus the triggering user turn's own
+ * `startMs`) rather than resolving `context`/attribution/`wasInterrupted`/dedup immediately; all of
+ * that is resolved once, from scratch, inside `finalize()` (never mutating persistent session state,
+ * so a duplicate `finalize()` call stays idempotent). A genuinely later response — one that starts
+ * playing well outside the tolerance window because it simply had not begun generating audio yet —
+ * is correctly left `"pre_playback"`; the tolerance is deliberately far smaller than the 250ms-1.5s
+ * confirmation window itself, so it cannot be satisfied by an unrelated response that only started
+ * because enough real time had passed, only by two transports narrowly disagreeing about one event.
+ *
+ * Overlap must have meaningful positive duration to be persisted — production surfaced 2 "overlap"
+ * events totaling ~0.5ms in a single session, which is far below any physically meaningful unit of
+ * simultaneous human speech. Two independently-timestamped `elapsed()` calls for two different
+ * WebRTC data-channel messages can differ by a fraction of a millisecond purely from JS event-loop
+ * processing order, never from anything acoustically real — `MIN_MEANINGFUL_OVERLAP_MS` filters
+ * these out at the source rather than reporting them as real (if numerically tiny) overlap events.
+ *
  * A related, separate correctness note: overlap and response latency intentionally use ONLY the
  * client monotonic clock end to end (`UserTurnMetric.startMs`/`endMs`, `AiTurnMetric.startMs`/
  * `endMs`) — never the server's separate `audio_start_ms`/`audio_end_ms` clock, which has no
@@ -291,6 +341,21 @@ interface MutableAiTurn {
   transcript: string | null;
 }
 
+/**
+ * Raw evidence for one recordConfirmedBargeIn() call, recorded as-is at the time it fires.
+ * context/attribution/dedup are deliberately NOT resolved here — see the module doc comment on the
+ * media/data-channel ordering race, part two — they are resolved once, from scratch, in finalize(),
+ * once the full timeline (including any output_audio_buffer.started that arrived shortly after
+ * speech began) is known.
+ */
+interface RawConfirmedBargeIn {
+  atMs: number;
+  audibleResponseIdAtStart: string | null;
+  pendingResponseIdAtStart: string | null;
+  /** The triggering user turn's own startMs — the anchor for the tolerance-window reconciliation. */
+  triggeringUserStartMs: number;
+}
+
 export interface SessionTimelineOptions {
   /** Monotonic clock — defaults to performance.now(). Injectable for deterministic tests. */
   now?: () => number;
@@ -362,6 +427,48 @@ function intervalsOverlap(a: { startMs: number; endMs: number }, b: { startMs: n
 }
 
 /**
+ * Maximum plausible skew between the WebRTC media transport (SRTP, carries the actual audio) and
+ * the Realtime data channel (SCTP, carries output_audio_buffer.started) reporting the SAME
+ * real-world event — both are multiplexed over one ICE/DTLS connection, so genuine transport skew
+ * for one event should be small (single/low-double-digit ms under normal conditions). Deliberately
+ * far smaller than the 250ms-1.5s barge-in confirmation window itself, so a response that only
+ * starts playing because real time passed (a true pre-playback case) cannot satisfy it — only two
+ * transports narrowly disagreeing about when the same audio began can. See the module doc comment
+ * on the media/data-channel ordering race, part two.
+ */
+const MEDIA_DATA_CHANNEL_SKEW_TOLERANCE_MS = 100;
+
+/**
+ * Below this duration, an "overlap" is indistinguishable from JS event-processing-order jitter
+ * between two independently-timestamped WebRTC data-channel messages (dispatched a fraction of a
+ * millisecond apart purely due to processing order, not anything acoustically real) rather than
+ * genuine simultaneous speech — real human speech overlap operates on the order of tens to hundreds
+ * of milliseconds at minimum, comfortably above this floor. See the module doc comment.
+ */
+const MIN_MEANINGFUL_OVERLAP_MS = 10;
+
+/**
+ * Resolves one raw confirmed-barge-in's final audible/pre_playback context and AI-response
+ * attribution against the full, now-complete timeline. See the module doc comment on the
+ * media/data-channel ordering race, part two, for the reconciliation rule.
+ */
+function resolveBargeInContext(
+  raw: RawConfirmedBargeIn,
+  aiTurnsByResponseId: ReadonlyMap<string, MutableAiTurn>,
+): { interruptedResponseId: string | null; context: BargeInContext } {
+  if (raw.audibleResponseIdAtStart !== null) {
+    return { interruptedResponseId: raw.audibleResponseIdAtStart, context: "audible" };
+  }
+  if (raw.pendingResponseIdAtStart !== null) {
+    const pendingTurn = aiTurnsByResponseId.get(raw.pendingResponseIdAtStart);
+    if (pendingTurn && pendingTurn.startMs - raw.triggeringUserStartMs <= MEDIA_DATA_CHANNEL_SKEW_TOLERANCE_MS) {
+      return { interruptedResponseId: raw.pendingResponseIdAtStart, context: "audible" };
+    }
+  }
+  return { interruptedResponseId: raw.pendingResponseIdAtStart, context: "pre_playback" };
+}
+
+/**
  * Structural sanity checks over a finalized snapshot — never used to clamp/reject the data, only to
  * surface a lifecycle bug loudly (console.error in finalize()) so it's fixed at the source rather
  * than papered over. This product never plays more than one AI audio stream at a time and a user
@@ -421,7 +528,10 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
   const userTurnOrder: string[] = [];
   const aiTurnsByResponseId = new Map<string, MutableAiTurn>();
   const aiTurnOrder: string[] = [];
-  const confirmedBargeIns: ConfirmedBargeInMetric[] = [];
+  /** Raw evidence only — context/attribution/dedup are resolved from scratch in finalize(). See
+   *  RawConfirmedBargeIn and the module doc comment on the media/data-channel ordering race, part
+   *  two. */
+  const provisionalBargeIns: RawConfirmedBargeIn[] = [];
   const responseCancellations: ResponseCancelledMetric[] = [];
   let currentAiResponseId: string | null = null;
   /** A response that has received response.created but not yet output_audio_buffer.started — see
@@ -433,9 +543,6 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
    *  before confirmation never reaches onConfirmedBargeIn), so this is how recordConfirmedBargeIn()
    *  attributes the confirmation back to the specific user turn that earned it. */
   let currentOpenUserItemId: string | null = null;
-  /** AI response ids that have already produced a counted audible interruption — see the module
-   *  doc comment on idempotent audible interruption. */
-  const audibleInterruptedResponseIds = new Set<string>();
 
   /** Shared by recordAiAudioStopped/recordAiAudioCleared/recordResponseDone's safety net — closing
    *  an AI turn is idempotent regardless of which event does it first. */
@@ -537,27 +644,17 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
       // whichever user turn is currently open is unambiguously the one that earned it.
       const userTurn = currentOpenUserItemId ? userTurnsByItemId.get(currentOpenUserItemId) : null;
 
-      // Use the AI state SNAPSHOTTED when this user turn's speech started, not live state read now
-      // — see the module doc comment on classifying audible-vs-pre_playback at speech-start time.
-      // The `userTurn` guard is a defensive fallback only (the invariant above should always hold);
-      // falling back to live state here is strictly no worse than the pre-fix behavior.
-      const audibleResponseId = userTurn ? userTurn.audibleAiResponseIdAtStart : currentAiResponseId;
-      const pendingResponseIdAtStart = userTurn ? userTurn.pendingAiResponseIdAtStart : pendingResponseId;
-      const interruptedResponseId = audibleResponseId ?? pendingResponseIdAtStart;
-      // "audible" iff AI audio was actually playing WHEN THIS SPEECH INTERVAL BEGAN; otherwise this
-      // is a pre-playback cancellation — a real technical barge-in, but not an audible interruption.
-      const context: BargeInContext = audibleResponseId !== null ? "audible" : "pre_playback";
-      // Idempotent per AI response — see the module doc comment on idempotent audible interruption.
-      const countsTowardInterruption =
-        context === "audible" && interruptedResponseId !== null && !audibleInterruptedResponseIds.has(interruptedResponseId);
-      if (context === "audible" && interruptedResponseId !== null) {
-        audibleInterruptedResponseIds.add(interruptedResponseId);
-      }
-      confirmedBargeIns.push({ atMs: elapsed(), aiResponseId: interruptedResponseId, context, countsTowardInterruption });
-      // Mark the interval that was ACTUALLY audible when the interruption began — consistent with
-      // the attribution above, not whatever AI turn happens to be "current" now.
-      const aiTurn = audibleResponseId ? aiTurnsByResponseId.get(audibleResponseId) : null;
-      if (aiTurn) aiTurn.wasInterrupted = true;
+      // Record raw evidence only — context/attribution/dedup are resolved later, in finalize(),
+      // once the full timeline is known. See the module doc comment on the media/data-channel
+      // ordering race, part two. The `userTurn` guard is a defensive fallback only (the invariant
+      // above should always hold); falling back to live state here is strictly no worse than
+      // treating this as an ordinary (non-snapshotted) read.
+      provisionalBargeIns.push({
+        atMs: elapsed(),
+        audibleResponseIdAtStart: userTurn ? userTurn.audibleAiResponseIdAtStart : currentAiResponseId,
+        pendingResponseIdAtStart: userTurn ? userTurn.pendingAiResponseIdAtStart : pendingResponseId,
+        triggeringUserStartMs: userTurn ? userTurn.startMs : elapsed(),
+      });
       if (userTurn) userTurn.triggeredConfirmedBargeIn = true;
     },
 
@@ -610,6 +707,26 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
       // unabridged, for diagnostic/audit purposes.
       const confirmedUserTurns = userTurns.filter((t) => t.classification === "confirmed");
 
+      // Resolve every confirmed barge-in's final context/attribution against the full timeline —
+      // must run BEFORE aiTurns is built below, so a retroactive "audible" reclassification's
+      // wasInterrupted marking is reflected in the immutable snapshot. Recomputed from scratch (a
+      // fresh dedup set, not a persistent one) so a duplicate finalize() call stays idempotent. See
+      // the module doc comment on the media/data-channel ordering race, part two.
+      const audibleInterruptedResponseIds = new Set<string>();
+      const confirmedBargeIns: ConfirmedBargeInMetric[] = provisionalBargeIns.map((raw) => {
+        const { interruptedResponseId, context } = resolveBargeInContext(raw, aiTurnsByResponseId);
+        const countsTowardInterruption =
+          context === "audible" && interruptedResponseId !== null && !audibleInterruptedResponseIds.has(interruptedResponseId);
+        if (context === "audible" && interruptedResponseId !== null) {
+          audibleInterruptedResponseIds.add(interruptedResponseId);
+        }
+        if (context === "audible" && interruptedResponseId !== null) {
+          const aiTurn = aiTurnsByResponseId.get(interruptedResponseId);
+          if (aiTurn) aiTurn.wasInterrupted = true;
+        }
+        return { atMs: raw.atMs, aiResponseId: interruptedResponseId, context, countsTowardInterruption };
+      });
+
       const aiTurns: AiTurnMetric[] = aiTurnOrder.map((responseId) => {
         const t = aiTurnsByResponseId.get(responseId)!;
         const endMs = t.endMs ?? finalizedAtMs;
@@ -636,7 +753,9 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
         for (const a of aiTurns) {
           const start = Math.max(u.startMs, a.startMs);
           const end = Math.min(u.endMs, a.endMs);
-          if (end > start) {
+          // Below MIN_MEANINGFUL_OVERLAP_MS, an "overlap" is indistinguishable from event-processing
+          // jitter between two independently-timestamped events, not real simultaneous speech.
+          if (end - start >= MIN_MEANINGFUL_OVERLAP_MS) {
             overlaps.push({ startMs: start, endMs: end, durationMs: end - start, userItemId: u.itemId, aiResponseId: a.responseId });
           }
         }

@@ -1193,3 +1193,181 @@ describe("createSessionTimeline — audible classification uses state at speech-
     expect(snapshot.overlaps[0].durationMs).toBe(300); // computed entirely from client-clock values
   });
 });
+
+/**
+ * Regression coverage for the media/data-channel ordering race, part two: WebRTC media (SRTP,
+ * carries the actual audio) and the Realtime data channel (SCTP, carries
+ * output_audio_buffer.started) are two transports with no guaranteed relative ordering. A control
+ * test — one deliberate, audible interruption — still came back as confirmed_interruption_count=0
+ * and overlap≈0.5ms across 2 events even after snapshotting AI state at speech-start time. Root
+ * cause: the audio can genuinely reach the user's speakers moments before output_audio_buffer.started
+ * for that same response has been processed on the data channel, so the at-start snapshot still saw
+ * "pending, not yet playing" even though the user could already hear it. Fixed with a bounded
+ * reconciliation, resolved at finalize() time (once the full timeline — including any .started that
+ * arrived shortly after speech began — is known): if the pending response's .started lands within
+ * MEDIA_DATA_CHANNEL_SKEW_TOLERANCE_MS (100ms) after the user's speech started, it is treated as the
+ * same real event reported a few ms apart by two transports, and reclassified "audible". A response
+ * that only starts playing well outside that tolerance (a true pre-playback case) is left alone.
+ */
+describe("createSessionTimeline — media/data-channel ordering race reconciliation", () => {
+  it("reclassifies as audible when output_audio_buffer.started for the pending response lands shortly after speech_started (reproduces the production event ordering)", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    // The response is created, but the data channel's output_audio_buffer.started hasn't been
+    // processed yet when the user starts speaking — even though, per WebRTC media/data-channel
+    // skew, the actual audio may already be reaching the user's speakers at this exact moment.
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(50);
+    timeline.recordUserSpeechStarted("item_1");
+
+    // output_audio_buffer.started for the SAME response arrives a few ms later — well within
+    // plausible transport skew, not because real time passed and a new response happened to start.
+    clock.advance(15);
+    timeline.recordAiAudioStarted("resp_1");
+
+    // The confirmation window elapses; the user is confirmed to have interrupted resp_1.
+    clock.advance(235); // total 250ms since speech_started
+    timeline.recordConfirmedBargeIn();
+    clock.advance(20);
+    timeline.recordAiAudioCleared("resp_1");
+    timeline.recordResponseDone("resp_1", "cancelled");
+    clock.advance(400);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Wait, let me jump in here.");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.confirmedBargeIns).toHaveLength(1);
+    expect(snapshot.confirmedBargeIns[0].context).toBe("audible");
+    expect(snapshot.confirmedBargeIns[0].aiResponseId).toBe("resp_1");
+    expect(snapshot.session.confirmedInterruptionCount).toBe(1);
+    expect(snapshot.session.technicalBargeInCount).toBe(1);
+    expect(snapshot.aiTurns[0].wasInterrupted).toBe(true);
+
+    // Overlap should reflect the real intersection between the two turns' recorded intervals — a
+    // meaningful positive duration (well above the 10ms "real overlap" floor), not a near-zero
+    // event-processing-order artifact.
+    expect(snapshot.overlaps).toHaveLength(1);
+    expect(snapshot.overlaps[0].durationMs).toBeGreaterThan(10);
+  });
+
+  it("does NOT reclassify a response that starts well outside the tolerance window as audible (a true pre-playback case)", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(50);
+    timeline.recordUserSpeechStarted("item_1");
+
+    // output_audio_buffer.started arrives much later — 500ms after speech started, well outside
+    // any plausible transport-skew tolerance. The model genuinely had not started producing audio
+    // yet when the user began talking; this must remain pre_playback.
+    clock.advance(500);
+    timeline.recordAiAudioStarted("resp_1");
+
+    clock.advance(50); // confirmation had already fired earlier, at 250ms after speech_started
+    timeline.recordConfirmedBargeIn();
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.confirmedBargeIns[0].context).toBe("pre_playback");
+    expect(snapshot.session.confirmedInterruptionCount).toBe(0);
+    expect(snapshot.session.technicalBargeInCount).toBe(1);
+  });
+
+  it("does not filter a genuinely reclassified interruption's overlap even when the recorded interval is short", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(50);
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(10); // within tolerance
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(190); // total 250ms since speech_started
+    timeline.recordConfirmedBargeIn();
+    clock.advance(30);
+    timeline.recordAiAudioCleared("resp_1"); // AI turn: 60 -> 280ms (220ms duration)
+    timeline.recordResponseDone("resp_1", "cancelled");
+    clock.advance(300);
+    timeline.recordUserSpeechStopped("item_1"); // user turn: 50 -> 580ms
+    timeline.recordUserTranscript("item_1", "Hold on.");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.overlaps).toHaveLength(1);
+    // Overlap window: [max(50,60), min(630,280)] = [60, 280] = 220ms — comfortably real.
+    expect(snapshot.overlaps[0].durationMs).toBe(220);
+  });
+
+  it("filters out a near-zero overlap that is indistinguishable from event-processing-order jitter", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(100);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(999);
+    // A user turn starts just 1ms before the AI turn ends — the recorded boundary lands a fraction
+    // of a millisecond into the AI turn's own interval, an artifact of two independently-timestamped
+    // events, not real simultaneous speech.
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(1);
+    timeline.recordAiAudioStopped("resp_1"); // AI turn: 100 -> 1100ms
+    timeline.recordResponseDone("resp_1", "completed");
+    clock.advance(500);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "So, about the deadline.");
+
+    const snapshot = timeline.finalize();
+    // The 1ms intersection is well under MIN_MEANINGFUL_OVERLAP_MS and must not be reported.
+    expect(snapshot.overlaps).toHaveLength(0);
+    expect(snapshot.session.overlapCount).toBe(0);
+    expect(snapshot.session.totalOverlapMs).toBe(0);
+  });
+
+  it("required result: AI audibly speaking -> user interrupts -> barge-in confirms -> AI stops produces exactly one technical and one coaching-facing interruption with meaningful overlap", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(150);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(2000); // AI has been audibly speaking for 2s — unambiguous
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+    clock.advance(30);
+    timeline.recordAiAudioCleared("resp_1");
+    timeline.recordResponseDone("resp_1", "cancelled");
+    clock.advance(400);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Actually, I disagree with that.");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.session.technicalBargeInCount).toBe(1);
+    expect(snapshot.session.confirmedInterruptionCount).toBe(1);
+    expect(snapshot.confirmedBargeIns[0].context).toBe("audible");
+    expect(snapshot.overlaps).toHaveLength(1);
+    expect(snapshot.overlaps[0].durationMs).toBeGreaterThan(100);
+  });
+
+  it("required result: response created, user starts before any AI audio is ever heard, produces zero coaching interruption and zero overlap", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(80);
+    timeline.recordUserSpeechStarted("item_1"); // no output_audio_buffer.started ever fires for resp_1
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+    timeline.recordResponseDone("resp_1", "cancelled"); // never produced any audio
+    clock.advance(400);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "I wanted to say something.");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.session.confirmedInterruptionCount).toBe(0);
+    expect(snapshot.session.overlapCount).toBe(0);
+    expect(snapshot.session.totalOverlapMs).toBe(0);
+    expect(snapshot.aiTurns).toHaveLength(0); // no phantom AI turn for audio that never played
+  });
+});
