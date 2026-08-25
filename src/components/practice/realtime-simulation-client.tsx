@@ -13,6 +13,10 @@ import { computeRemainingSeconds } from "@/lib/practice/timer";
 import { transitionRealtimeConnection, type RealtimeConnectionState } from "@/lib/realtime/connectionState";
 import { connectRealtimeSession, type RealtimeConnection } from "@/lib/realtime/webrtcClient";
 import { waitForPendingUserTranscription } from "@/lib/realtime/pendingTranscription";
+import { waitForCurrentExchangeToFinish } from "@/lib/realtime/exchangeCompletion";
+import { logFinalizationStage } from "@/lib/realtime/finalizationLog";
+
+const NAVIGATION_STALL_TIMEOUT_MS = 8000;
 
 export interface RealtimeSimulationClientProps {
   sessionId: string;
@@ -52,6 +56,7 @@ export function RealtimeSimulationClient({
   const [showTextFallback, setShowTextFallback] = useState(false);
   const [textInput, setTextInput] = useState("");
   const [remaining, setRemaining] = useState(() => computeRemainingSeconds(startedAtIso, durationSeconds));
+  const [navigationStalled, setNavigationStalled] = useState(false);
 
   const connectionRef = useRef<RealtimeConnection | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement>(null);
@@ -62,6 +67,18 @@ export function RealtimeSimulationClient({
   const errorRetryRef = useRef<(() => void) | null>(null);
   const connectingRef = useRef(false);
   const pendingUserTranscriptionRef = useRef(false);
+  const stateRef = useRef<RealtimeConnectionState>(state);
+  const navigationStartedAtRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
+
+  const logStage = useCallback(
+    (stage: Parameters<typeof logFinalizationStage>[1], extra?: Record<string, unknown>) =>
+      logFinalizationStage(sessionId, stage, extra),
+    [sessionId],
+  );
 
   // Persists transcript turns one at a time — Realtime can emit the user's and the AI's
   // transcript events in quick succession, and appendMessage() assigns sequence numbers via a
@@ -78,36 +95,63 @@ export function RealtimeSimulationClient({
     [sessionId],
   );
 
-  const finishAndEvaluate = useCallback(async () => {
-    if (endTriggeredRef.current) return;
-    endTriggeredRef.current = true;
-    try {
-      // Stop the AI from starting or continuing to talk right away — a no-op (harmless
-      // server-reported error, already logged non-fatally) if nothing was in progress.
-      connectionRef.current?.sendEvent({ type: "response.cancel" });
-      // Give the user's last utterance a bounded window to finish transcribing before the
-      // connection goes away, so ending right as they stop speaking doesn't silently drop it.
-      await waitForPendingUserTranscription(pendingUserTranscriptionRef);
-      connectionRef.current?.close();
-      connectionRef.current = null;
-      dispatch({ type: "EVALUATION_STARTED" });
-      // Drain any transcript writes already queued (including one just enqueued above) —
-      // appendMessage() is a read-then-write, so the final turn must be persisted before
-      // /api/practice/end reads the transcript, or it's invisible to the Evaluation Engine.
-      await transcriptQueueRef.current;
-      await postJson("/api/practice/end", { sessionId });
-      dispatch({ type: "EVALUATION_COMPLETE" });
-      router.push(`/practice/${sessionId}/feedback`);
-    } catch (error) {
-      endTriggeredRef.current = false;
-      const message = error instanceof Error ? error.message : "Couldn't generate feedback.";
-      setErrorMessage(message);
-      errorRetryRef.current = () => {
-        setErrorMessage(null);
-        void finishAndEvaluate();
-      };
-    }
-  }, [router, sessionId]);
+  const finishAndEvaluate = useCallback(
+    async (reason: "manual" | "timer") => {
+      if (endTriggeredRef.current) return;
+      endTriggeredRef.current = true;
+      try {
+        if (reason === "manual") {
+          // An explicit user stop cuts over immediately — cancel any in-progress AI turn rather
+          // than waiting for it, unlike ordinary timer expiry (see waitForCurrentExchangeToFinish).
+          dispatch({ type: "END_PRACTICE" });
+          connectionRef.current?.sendEvent({ type: "response.cancel" });
+        } else {
+          // 0:00 means finish after the current exchange, not cut it off mid-word: let the user
+          // finish speaking and let any resulting AI response play out completely before ending.
+          // No response.cancel here — nothing is being interrupted.
+          logStage("waiting_for_current_exchange_to_finish");
+          await waitForCurrentExchangeToFinish(stateRef, pendingUserTranscriptionRef);
+          dispatch({ type: "TIME_UP" });
+        }
+
+        // Give the user's last utterance a bounded window to finish transcribing before the
+        // connection goes away, so ending right as they stop speaking doesn't silently drop it.
+        logStage("waiting_for_final_turn_transcription");
+        await waitForPendingUserTranscription(pendingUserTranscriptionRef);
+
+        connectionRef.current?.close();
+        connectionRef.current = null;
+        logStage("realtime_closed");
+
+        dispatch({ type: "EVALUATION_STARTED" });
+
+        // Drain any transcript writes already queued (including one just enqueued above) —
+        // appendMessage() is a read-then-write, so the final turn must be persisted before
+        // /api/practice/end reads the transcript, or it's invisible to the Evaluation Engine.
+        await transcriptQueueRef.current;
+        logStage("transcript_flushed");
+
+        logStage("practice_end_started");
+        await postJson("/api/practice/end", { sessionId });
+        logStage("practice_end_succeeded");
+
+        dispatch({ type: "EVALUATION_COMPLETE" });
+        navigationStartedAtRef.current = Date.now();
+        logStage("navigation_started");
+        router.push(`/practice/${sessionId}/feedback`);
+      } catch (error) {
+        endTriggeredRef.current = false;
+        const message = error instanceof Error ? error.message : "Couldn't generate feedback.";
+        logStage("practice_end_failed", { message });
+        setErrorMessage(message);
+        errorRetryRef.current = () => {
+          setErrorMessage(null);
+          void finishAndEvaluate(reason);
+        };
+      }
+    },
+    [router, sessionId, logStage],
+  );
 
   const connect = useCallback(async () => {
     if (connectingRef.current) return;
@@ -226,11 +270,20 @@ export function RealtimeSimulationClient({
     return () => {
       connectionRef.current?.close();
       connectionRef.current = null;
+      // This component unmounts when navigation away actually lands — logging here (rather than
+      // right after router.push) is what tells us navigation genuinely completed, as opposed to
+      // silently stalling with the old page still mounted (see navigationStalled below).
+      if (navigationStartedAtRef.current) {
+        logFinalizationStage(sessionId, "navigation_completed", {
+          elapsedMs: Date.now() - navigationStartedAtRef.current,
+        });
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Countdown timer — identical behavior to the batch simulation screen.
+  // Countdown timer — identical behavior to the batch simulation screen, except reaching 0:00 no
+  // longer ends the session immediately (see finishAndEvaluate's "timer" branch).
   useEffect(() => {
     if (state === "ending" || state === "evaluating" || state === "complete") return;
     const interval = setInterval(() => {
@@ -238,17 +291,29 @@ export function RealtimeSimulationClient({
       setRemaining(next);
       if (next <= 0) {
         clearInterval(interval);
-        dispatch({ type: "TIME_UP" });
-        void finishAndEvaluate();
+        logStage("timer_expired");
+        void finishAndEvaluate("timer");
       }
     }, 1000);
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state, startedAtIso, durationSeconds]);
 
+  // router.push() is fire-and-forget — it returns void and never surfaces a stalled or failed
+  // background navigation. If evaluation succeeded but this component is still mounted well after
+  // navigation was requested, offer a manual way out rather than leaving the user stuck forever.
+  useEffect(() => {
+    if (state !== "complete") return;
+    const timeout = setTimeout(() => {
+      logStage("navigation_stalled");
+      setNavigationStalled(true);
+    }, NAVIGATION_STALL_TIMEOUT_MS);
+    return () => clearTimeout(timeout);
+  }, [state, logStage]);
+
   function handleEndPractice() {
-    dispatch({ type: "END_PRACTICE" });
-    void finishAndEvaluate();
+    logStage("end_practice_requested");
+    void finishAndEvaluate("manual");
   }
 
   async function handleTextSubmit(e: React.FormEvent) {
@@ -270,7 +335,14 @@ export function RealtimeSimulationClient({
     errorRetryRef.current?.();
   }
 
-  const isEnding = state === "ending" || state === "evaluating";
+  // "complete" is included here (not just "ending"/"evaluating") so the session never flips back
+  // to showing live mic/text controls once it's actually over — it's either about to navigate
+  // away, or navigationStalled below is offering a manual way out. Root cause of the production
+  // "stuck on Wrapping up…" report: this state previously had no distinct label, and router.push()
+  // has no way to report a stalled or failed background navigation, so there was nothing to
+  // distinguish "still evaluating" from "done, waiting on navigation" — or to recover from the
+  // latter.
+  const isEnding = state === "ending" || state === "evaluating" || state === "complete";
   const stageLabel =
     state === "connecting"
       ? "Connecting…"
@@ -282,7 +354,9 @@ export function RealtimeSimulationClient({
             ? `${aiLabel} is speaking…`
             : state === "error"
               ? "Paused"
-              : "Wrapping up…";
+              : state === "complete"
+                ? "Feedback ready — opening…"
+                : "Wrapping up…";
 
   return (
     <div className="flex min-h-[calc(100dvh-8.5rem)] flex-col">
@@ -353,6 +427,25 @@ export function RealtimeSimulationClient({
         </div>
       ) : null}
 
+      {navigationStalled ? (
+        <div className="mb-3 flex flex-col items-center gap-2 rounded-xl bg-surface-muted px-4 py-3 text-center text-sm text-foreground-muted">
+          <span>Your feedback is ready, but we couldn&apos;t automatically open it.</span>
+          <Button
+            type="button"
+            size="sm"
+            onClick={() => {
+              // A plain full-page navigation, deliberately not router.push() — this is the
+              // recovery path for exactly the case where the client-side router already failed
+              // to get us here. Evaluation already succeeded, so this only re-reads it, never
+              // re-runs it.
+              window.location.assign(`/practice/${sessionId}/feedback`);
+            }}
+          >
+            View feedback
+          </Button>
+        </div>
+      ) : null}
+
       {!isEnding ? (
         <div className="flex flex-col gap-2 border-t border-border pt-3">
           {showTextFallback ? (
@@ -400,7 +493,8 @@ export function RealtimeSimulationClient({
         </div>
       ) : (
         <div className="flex items-center justify-center gap-2 border-t border-border pt-3 text-sm text-foreground-muted">
-          <Spinner className="h-4 w-4" /> Wrapping up and preparing your feedback…
+          <Spinner className="h-4 w-4" />
+          {state === "complete" ? "Opening your feedback…" : "Wrapping up and preparing your feedback…"}
         </div>
       )}
 

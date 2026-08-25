@@ -76,6 +76,8 @@ See /docs/DECISIONS.md "Realtime voice rollout" for the full architecture. Batch
 - [x] Phase 2 — Timer and End Practice behavior preserved exactly; post-session Evaluation Engine untouched
 - [x] Graceful session completion — ending (timer or End Practice) now cancels any in-progress AI turn, waits briefly for the user's final utterance to finish transcribing, and flushes queued transcript writes before evaluation runs, so the last turn is never silently dropped
 - [x] Evaluation Engine safety guardrail — the coach prompt now explicitly forbids claiming to have observed tone, pace, pauses, confidence, or any other paralinguistic/vocal signal, since only a text transcript is ever provided (no scoring/schema/feedback-format changes)
+- [x] Production fix — the "stuck on Wrapping up…" hang: `"complete"` now has its own status label and can't fall back to live mic/text controls, and a bounded watchdog shows a "View feedback" recovery button (hard navigation) if `router.push` stalls after a successful evaluation; every finalization stage is now logged client-side
+- [x] Production fix — timer expiry no longer cancels an in-progress AI turn; it waits for the current exchange (user's utterance + any resulting AI response) to finish naturally before ending, so the AI is never cut off mid-word at 0:00. Manual End Practice is unchanged (immediate stop).
 - [ ] Not yet: Training Mode hints wired into the Realtime screen
 - [ ] Not yet: vocal/prosody analytics (pace, pauses, latency, intensity) — see the voice audit in chat history for the full breakdown of what's possible without further architecture changes
 - [ ] Not yet: raw audio persistence
@@ -83,7 +85,7 @@ See /docs/DECISIONS.md "Realtime voice rollout" for the full architecture. Batch
 
 ## Testing
 
-- [x] Vitest: timer, state machine transitions, scoring/weight math, attempt numbering, previous-attempt selection, comparison logic, evaluation schema validation, RLS/authorization-relevant query helpers, voice error classification, Realtime connection-state transitions, Realtime graceful-completion wait helper, Evaluation Engine paralinguistic-safety guardrail
+- [x] Vitest: timer, state machine transitions, scoring/weight math, attempt numbering, previous-attempt selection, comparison logic, evaluation schema validation, RLS/authorization-relevant query helpers, voice error classification, Realtime connection-state transitions, Realtime graceful-completion wait helpers (pending-transcription and current-exchange), finalization logging, Evaluation Engine paralinguistic-safety guardrail
 - [x] Playwright: login → choose skill → choose scenario → start practice → exchange messages → end practice → evaluate → view feedback → try again (mocked AI provider, no live API calls; covers the batch path — Realtime requires a live OpenAI account and browser WebRTC support, so it isn't exercised by this automated suite)
 
 ## Out of scope for this MVP (do not build without an explicit request)
