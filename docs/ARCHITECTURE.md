@@ -117,10 +117,23 @@ Illegal transitions (e.g. `recording` while `interlocutor_speaking`) are simply 
 
 ## 9. Voice architecture
 
+Two parallel implementations exist, selected per-session by `REALTIME_VOICE_ENABLED` (see /docs/DECISIONS.md "Realtime voice rollout"). The batch path is the original MVP implementation and the deliberate fallback/rollback target; Realtime is the target experience once verified.
+
+### 9.1 Batch (STT → LLM → TTS), the fallback path
+
 - `SpeechToTextProvider.transcribe(audio)`, `TextToSpeechProvider.synthesize(text)` interfaces in `src/lib/voice`. OpenAI implementations (Whisper transcription, OpenAI TTS) behind Route Handlers (`/api/voice/stt`, `/api/voice/tts`); a `MockProvider` pair is used automatically when `OPENAI_API_KEY` is absent, and the UI shows a clear "voice unavailable, using text mode" state rather than pretending mock audio is real.
 - Client records with `MediaRecorder` (push-to-talk button), uploads the blob to `/api/voice/stt`, gets a transcript back, and feeds it into the same `/api/simulation/respond` flow as typed input — voice and text share one code path after transcription. The interlocutor's reply text is sent to `/api/voice/tts` and played via an `<audio>` element.
-- This is deliberately turn-based HTTP, not a realtime/streaming connection — no server process needs to stay alive for the duration of the call, which fits Vercel. A `RealtimeVoiceProvider` interface slot is documented (not implemented) for a future upgrade (e.g. OpenAI Realtime API over WebRTC with short-lived client secrets minted server-side) without needing to redesign the rest of the app.
-- Microphone permission denial, transcription failure, and TTS failure all map to explicit state-machine `error` transitions with a recovery path (retry or fall back to typed input) — never a silent hang.
+- This is deliberately turn-based HTTP, not a realtime/streaming connection — no server process needs to stay alive for the duration of the call, which fits Vercel.
+- Microphone permission denial, transcription failure, and TTS failure all map to explicit state-machine `error` transitions with a recovery path (retry or fall back to typed input) — never a silent hang. Failures are categorized (`src/lib/voice/errorClassification.ts`) so only a genuinely unconfigured provider disables voice for the rest of a session — every other failure (rate limit, quota, network, etc.) stays retryable.
+
+### 9.2 Realtime (WebRTC speech-to-speech), the target path
+
+- `src/lib/realtime/session.ts` (server-only) mints a short-lived OpenAI Realtime client secret via `POST /api/simulation/realtime/session`, with the full session config — model, the *same* `buildInterlocutorSystemPrompt()` instructions used by the batch engine, voice, and `server_vad` turn detection — baked in server-side. `OPENAI_API_KEY` never reaches the browser.
+- `src/lib/realtime/webrtcClient.ts` (browser-only) opens the mic, negotiates a `RTCPeerConnection` directly against OpenAI (`https://api.openai.com/v1/realtime/calls`) using that ephemeral secret, and exposes a data channel for session/transcript events. Audio flows peer-to-peer between the browser and OpenAI — it never transits our server.
+- `src/components/practice/realtime-simulation-client.tsx` drives a dedicated, simpler state machine (`src/lib/realtime/connectionState.ts`: `connecting → listening ⇄ user_speaking → thinking → speaking → …`, distinct from the batch flow's `stateMachine.ts` — continuous listening has no "recording"/"transcribing" steps) and renders a calm state indicator (Listening/Thinking/Speaking + connection status) rather than a chat transcript, per the product requirement that voice practice should feel like a conversation, not a message log.
+- Transcript persistence is the one place the server is still involved mid-conversation: as the data channel emits `conversation.item.input_audio_transcription.completed` (user) and `response.output_audio_transcript.done` (AI) events, the client POSTs each completed turn to `/api/simulation/realtime/transcript`, which calls the same `appendMessage()` used by the batch flow — so `conversation_messages` looks identical regardless of transport, and the post-session Evaluation Engine (`src/lib/coaching/*`, invoked via `/api/practice/end`) needs no changes at all.
+- Timer and End Practice are identical in behavior to the batch screen (same `computeRemainingSeconds` utility, same `/api/practice/end` call on timeout or manual end) — only the transport and the mid-conversation UI differ.
+- Typed input remains available as a secondary fallback *within* an active Realtime session (sent as a `conversation.item.create` + `response.create` pair over the data channel, and persisted the same way as spoken turns) — separate from the deployment-level rollback to the batch component entirely.
 
 ## 10. State management
 

@@ -64,10 +64,25 @@ Phased implementation plan. Check items off as completed; see `/docs/STATUS.md` 
 - [x] Production build verified
 - [x] Vercel deployment checklist verified
 
+## Phase 7 — Realtime voice (speech-to-speech), behind a rollback switch
+
+See /docs/DECISIONS.md "Realtime voice rollout" for the full architecture. Batch voice (Phase 3) is kept fully intact as the fallback/rollback path — `REALTIME_VOICE_ENABLED` defaults off.
+
+- [x] Phase 1 — Server-side ephemeral Realtime client secret endpoint (`/api/simulation/realtime/session`), reusing the existing Simulation Prompt Builder verbatim; `OPENAI_API_KEY` never reaches the browser
+- [x] Phase 1 — Browser WebRTC connection (mic capture, data channel, SDP exchange) — no SDK helper exists for this, hand-rolled per OpenAI's WebRTC guide
+- [x] Phase 2 — `server_vad` turn detection so the user never has to press Stop; AI opening line spoken via a scoped `response.create`
+- [x] Phase 2 — Incremental transcript persistence into the existing `conversation_messages` table via `/api/simulation/realtime/transcript`, serialized client-side to avoid a sequence-number race
+- [x] Phase 2 — Dedicated, simpler connection-state UI (Listening/Thinking/Speaking + connection status) instead of a chat transcript; secondary typed-input fallback within an active session
+- [x] Phase 2 — Timer and End Practice behavior preserved exactly; post-session Evaluation Engine untouched
+- [ ] Not yet: Training Mode hints wired into the Realtime screen
+- [ ] Not yet: vocal/prosody analytics (pace, pauses, latency, intensity) — see the voice audit in chat history for the full breakdown of what's possible without further architecture changes
+- [ ] Not yet: raw audio persistence
+- [ ] Not yet: verified against a live OpenAI account in production (see /docs/STATUS.md)
+
 ## Testing
 
-- [x] Vitest: timer, state machine transitions, scoring/weight math, attempt numbering, previous-attempt selection, comparison logic, evaluation schema validation, RLS/authorization-relevant query helpers
-- [x] Playwright: login → choose skill → choose scenario → start practice → exchange messages → end practice → evaluate → view feedback → try again (mocked AI provider, no live API calls)
+- [x] Vitest: timer, state machine transitions, scoring/weight math, attempt numbering, previous-attempt selection, comparison logic, evaluation schema validation, RLS/authorization-relevant query helpers, voice error classification, Realtime connection-state transitions
+- [x] Playwright: login → choose skill → choose scenario → start practice → exchange messages → end practice → evaluate → view feedback → try again (mocked AI provider, no live API calls; covers the batch path — Realtime requires a live OpenAI account and browser WebRTC support, so it isn't exercised by this automated suite)
 
 ## Out of scope for this MVP (do not build without an explicit request)
 

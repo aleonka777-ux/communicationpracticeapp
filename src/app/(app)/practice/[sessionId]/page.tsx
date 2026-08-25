@@ -4,12 +4,21 @@ import { getSessionWithContext } from "@/lib/db/sessions";
 import { listMessages } from "@/lib/db/messages";
 import { getAIProvider } from "@/lib/ai";
 import { isVoiceAvailable } from "@/lib/voice";
+import { serverEnv } from "@/lib/env";
 import { SimulationClient } from "@/components/practice/simulation-client";
+import { RealtimeSimulationClient } from "@/components/practice/realtime-simulation-client";
 
 export const dynamic = "force-dynamic";
 
-export default async function PracticeSessionPage({ params }: { params: Promise<{ sessionId: string }> }) {
+export default async function PracticeSessionPage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ sessionId: string }>;
+  searchParams: Promise<{ voiceMode?: string }>;
+}) {
   const { sessionId } = await params;
+  const { voiceMode } = await searchParams;
   const supabase = await createClient();
   const {
     data: { user },
@@ -23,6 +32,24 @@ export default async function PracticeSessionPage({ params }: { params: Promise<
     redirect(`/practice/${sessionId}/feedback`);
   }
   if (session.status === "abandoned") notFound();
+
+  // Realtime is the target experience, but stays behind a rollback switch (see
+  // /docs/DECISIONS.md "Realtime voice rollout") until it's been verified in production, and can
+  // always be escaped per-session via ?voiceMode=batch (surfaced by the Realtime screen itself if
+  // the WebRTC connection can't be established).
+  const useRealtime = serverEnv.realtimeVoiceEnabled && isVoiceAvailable() && voiceMode !== "batch";
+
+  if (useRealtime) {
+    return (
+      <RealtimeSimulationClient
+        sessionId={session.id}
+        aiLabel={session.scenario.ai_role}
+        userObjective={session.scenario.user_objective}
+        startedAtIso={session.started_at}
+        durationSeconds={session.selected_duration_seconds}
+      />
+    );
+  }
 
   const messages = await listMessages(supabase, sessionId);
 

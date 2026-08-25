@@ -24,4 +24,18 @@ export const serverEnv = {
   get openaiApiKey() {
     return process.env.OPENAI_API_KEY;
   },
+  /**
+   * Rollback switch for the Realtime voice layer (see /docs/DECISIONS.md "Realtime voice
+   * rollout"). Defaults to off so the well-tested batch STT/TTS path keeps serving production
+   * until Realtime has been verified; flip to "true" in Vercel once it's ready.
+   */
+  get realtimeVoiceEnabled() {
+    return process.env.REALTIME_VOICE_ENABLED === "true";
+  },
+  get realtimeModel() {
+    return process.env.OPENAI_REALTIME_MODEL ?? "gpt-realtime-2.1";
+  },
+  get realtimeVoice() {
+    return process.env.OPENAI_REALTIME_VOICE ?? "alloy";
+  },
 };

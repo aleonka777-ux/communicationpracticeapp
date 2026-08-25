@@ -1,10 +1,17 @@
 # Status — Virtual Communication Coach
 
-Last updated: 2026-08-14 (initial build session).
+Last updated: Realtime voice Phase 1 + 2 session.
 
 ## Current phase
 
-All six build phases (see `docs/BUILD_PLAN.md`) are implemented. The app is feature-complete for the MVP scope and passes lint, typecheck, unit tests, and a production build. It has not yet been run against a live Supabase project or a live OpenAI account (see "Known limitations" below).
+All six original MVP build phases plus Realtime voice Phase 1 + 2 (see `docs/BUILD_PLAN.md`) are implemented. The app is feature-complete for the MVP scope plus a working speech-to-speech conversation path, and passes lint, typecheck, unit tests, and a production build. A Supabase project and an OpenAI API key have since been connected in production (Vercel) — see "Known limitations" for what's still unverified there specifically.
+
+## Realtime voice (Phase 1 + 2) — just added
+
+- Full architecture in `docs/DECISIONS.md` ("Realtime voice rollout") and `docs/ARCHITECTURE.md` §9.2.
+- **Off by default** — set `REALTIME_VOICE_ENABLED=true` in Vercel (alongside the already-configured `OPENAI_API_KEY`) to turn it on. Until then, every session uses the existing batch STT/TTS path unchanged.
+- Not yet exercised against a live OpenAI Realtime session in this build environment (no browser with microphone access here) — the one part of the implementation genuinely unverified end-to-end is the WebRTC SDP exchange against `https://api.openai.com/v1/realtime/calls`, which was inferred from the installed SDK's types/doc comments rather than observed working. First real test should specifically watch for this.
+- Known, deliberate gaps for this phase: Training Mode hints aren't wired into the Realtime screen; no vocal/prosody analytics; no raw audio persistence.
 
 ## Completed
 

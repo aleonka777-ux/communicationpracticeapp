@@ -67,6 +67,10 @@ Open [http://localhost:3000](http://localhost:3000).
 
 If `OPENAI_API_KEY` is unset, the app automatically uses a deterministic mock `AIProvider` and voice is disabled with a clear in-app notice — the full text practice loop (setup → conversation → evaluation → feedback → try again) still works end-to-end with zero external AI credentials. This is intentional (see `docs/DECISIONS.md`) so the product can be reviewed and tested without paying for API calls. Set `OPENAI_API_KEY` to get real interlocutor replies, coaching evaluation, speech-to-text, and text-to-speech.
 
+## Voice modes: batch (default) vs. Realtime
+
+Two voice implementations exist side by side (see `docs/ARCHITECTURE.md` §9): the original record → transcribe → reply → speak batch flow, and a newer Realtime (WebRTC speech-to-speech) flow that feels like an actual live conversation. Realtime is off by default — set `REALTIME_VOICE_ENABLED=true` (with `OPENAI_API_KEY` already set) to turn it on. It can be escaped per-session at any time by visiting `/practice/<sessionId>?voiceMode=batch`, which the Realtime screen also offers automatically if its connection fails. See `docs/DECISIONS.md` "Realtime voice rollout" for the full picture, including the one part of the implementation (the WebRTC connect endpoint) that's inferred from the OpenAI SDK's types rather than confirmed against a live test — worth double-checking first when trying this in production.
+
 ## Environment variables
 
 See [`.env.example`](./.env.example) for the full list with descriptions. Never commit real secrets — `.env*` is gitignored.
