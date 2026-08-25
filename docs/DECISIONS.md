@@ -2,6 +2,24 @@
 
 Significant technical decisions and the reasoning behind them. Newest at the top.
 
+## Evidence integrity: the Evaluation Engine was still generating vocal-delivery claims
+
+Production kept producing claims like "The user maintained a calm demeanor throughout the conversation" and "User responded without raising their voice" — direct violations of the paralinguistic-safety guardrail added earlier, even though the coach is only ever given a text transcript.
+
+**Root cause**: the guardrail sentence in `buildEvaluationSystemPrompt` (`src/lib/coaching/promptBuilder.ts`) was a *general* instruction, but several of the seeded `communication_tools` rows contained *specific, concrete* rubric text that directly asked the model to judge exactly the thing the guardrail forbade — a much stronger, more literal instruction that won out:
+- `setting-a-boundary`'s Non-escalation criterion: `"Did the user stay calm and avoid turning the exchange into a conflict?"` — asks the model to judge "calm" directly. This is the smoking gun for the "calm demeanor" claim.
+- `responding-to-aggression`'s core principle "Avoid mirroring the other person's volume or hostility" and common mistake "Matching the other person's hostility or volume" — "volume" is a literal audio measurement the coach doesn't have. This plausibly drove the "without raising their voice" claim.
+- `responding-to-aggression`'s coaching guidance: `"Reward calm, brief responses..."`.
+- `handling-criticism`'s core principle, step description, common mistake, and coaching guidance all used "tone" (`"...without accepting an unfair tone"`, `"...not just the tone"`, `"Arguing about tone..."`, `"...even if the tone stayed calm"`) — the tool's own methodology ("separate signal from delivery") is genuinely about not reacting to *how* something was delivered, but "tone" as written asks for a vocal judgment the coach can't make; the same idea is fully expressible as "framing"/"how it was phrased," which is visible in a transcript.
+
+None of `giving-difficult-feedback` or `asking-open-questions` had literal violations, but their Non-escalation criteria were reworded too, for consistency, to anchor them explicitly to "the words used in the transcript" per the requirement to keep the Non-escalation dimension but make it explicitly transcript-based.
+
+**Fix, two layers**:
+1. **Data**: `supabase/seed.sql` rewritten (the fields above no longer use calm/tone/volume/demeanor language, and every tool's Non-escalation criterion is now explicitly "based on the words used in the transcript"). `supabase/migrations/0008_evidence_integrity_rubric_fix.sql` applies the same fix to already-seeded production data — each `update` is guarded by a `where` clause matching the exact old seeded value, so a row a coach has since customized via `/admin` (and so no longer matches) is left untouched rather than silently overwritten. **This migration must be run against the production Supabase project (`supabase db push`) for the fix to take effect there** — editing `supabase/seed.sql` alone only affects future fresh seeds, not the already-seeded live rows.
+2. **Prompt, defense-in-depth**: `buildEvaluationSystemPrompt`'s guardrail now explicitly names "demeanor" alongside the existing tone/pace/pauses/confidence list, gives the exact two production sentences as forbidden examples, and — the important addition — states it *overrides anything above*: if a principle, common mistake, or evaluation criterion (Non-escalation included) is phrased using "calm," "tone," "voice," or "demeanor," the model must reinterpret it in terms of wording/language visible in the transcript, never assumed vocal delivery. This is the safety net for any future admin-authored tool that reintroduces this exact pattern without anyone noticing — the data fix alone wouldn't have covered that case.
+
+No scoring, schema, weights, or feedback-layout changes — only the rubric *text* used to justify the Non-escalation dimension's judgment, and how the coach interprets it.
+
 ## Production fixes: the "stuck on Wrapping up…" hang, and the AI getting cut off at 0:00
 
 Two production-confirmed bugs in the graceful-completion work below, fixed together since both live in `finishAndEvaluate()`.
