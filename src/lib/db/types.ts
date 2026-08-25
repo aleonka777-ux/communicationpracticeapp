@@ -212,6 +212,11 @@ export interface RealtimeTurnEventRow {
   user_turn_classification: RealtimeUserTurnClassification | null;
   transcription_failed: boolean | null;
   barge_in_context: RealtimeBargeInContext | null;
+  /** confirmed_barge_in rows only. False for a repeat confirmation against an AI response already
+   *  counted as interrupted, or for a pre_playback context. See
+   *  src/lib/realtime/sessionTimeline.ts's doc comment on idempotent audible interruption. Null for
+   *  every other kind. */
+  counts_toward_interruption: boolean | null;
   metadata: Record<string, unknown>;
   created_at: string;
 }

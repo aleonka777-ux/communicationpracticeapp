@@ -242,6 +242,12 @@ export function RealtimeSimulationClient({
         onConfirmedBargeIn: () => {
           if (aiAudioSpeechIncidentRef.current) aiAudioSpeechIncidentRef.current.wasInterrupted = true;
           connection.sendEvent({ type: "response.cancel" });
+          // response.cancel alone stops the server from generating further content but does NOT
+          // itself drain/stop the output audio buffer — without this, a genuinely interrupted
+          // response's output_audio_buffer.stopped can arrive very late or never, leaving its AI
+          // turn open for the rest of the session (see sessionTimeline.ts's doc comment on closing
+          // an AI turn reliably, and /docs/DECISIONS.md).
+          connection.sendEvent({ type: "output_audio_buffer.clear" });
           logRealtimeDebugEvent(sessionId, "response_cancelled", { reason: "confirmed_bargein" });
           metricsRef.current?.recordConfirmedBargeIn();
           metricsRef.current?.recordResponseCancelled(null, "confirmed_bargein");
@@ -421,6 +427,20 @@ export function RealtimeSimulationClient({
               if (responseId) metricsRef.current?.recordAiAudioStopped(responseId);
               // The startup-specific protection only ever applies to this one, first AI turn —
               // every turn after it reverts to the normal, shorter confirmation window.
+              isFirstAiResponseRef.current = false;
+              break;
+            }
+            case "output_audio_buffer.cleared": {
+              // Fires when the output audio buffer is explicitly cleared (our own
+              // output_audio_buffer.clear sent on a confirmed barge-in, above) rather than having
+              // naturally drained — the server-confirmed signal that this response's audio was cut
+              // off. Closes the AI turn exactly like output_audio_buffer.stopped, so an interrupted
+              // turn never stays open until session finalize (see sessionTimeline.ts's doc comment).
+              logRealtimeDebugEvent(sessionId, "ai_audio_cleared", { isFirstAiResponse: isFirstAiResponseRef.current });
+              bargeIn.handleAiSpeakingChanged(false);
+              dispatch({ type: "AI_FINISHED_SPEAKING" });
+              const responseId = event.response_id as string | undefined;
+              if (responseId) metricsRef.current?.recordAiAudioCleared(responseId);
               isFirstAiResponseRef.current = false;
               break;
             }

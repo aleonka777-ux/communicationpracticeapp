@@ -62,6 +62,9 @@ const confirmedBargeInSchema = z.object({
   // cancelled a response before it ever produced audio — not an audible interruption. See
   // src/lib/realtime/sessionTimeline.ts's doc comment.
   context: bargeInContextSchema,
+  // False for a repeat confirmation against an AI response already counted as interrupted, or for
+  // a pre_playback context — see sessionTimeline.ts's doc comment on idempotent audible interruption.
+  countsTowardInterruption: z.boolean(),
 });
 
 const sessionMetricsSchema = z.object({
@@ -126,6 +129,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         user_turn_classification: t.classification,
         transcription_failed: t.transcriptionFailed,
         barge_in_context: null,
+        counts_toward_interruption: null,
         metadata: {},
       }),
     ),
@@ -148,6 +152,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         user_turn_classification: null,
         transcription_failed: null,
         barge_in_context: null,
+        counts_toward_interruption: null,
         metadata: {},
       }),
     ),
@@ -170,6 +175,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         user_turn_classification: null,
         transcription_failed: null,
         barge_in_context: null,
+        counts_toward_interruption: null,
         metadata: {},
       }),
     ),
@@ -192,6 +198,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         user_turn_classification: null,
         transcription_failed: null,
         barge_in_context: b.context,
+        counts_toward_interruption: b.countsTowardInterruption,
         metadata: {},
       }),
     ),

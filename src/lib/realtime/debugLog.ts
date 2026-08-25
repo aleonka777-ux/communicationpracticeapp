@@ -16,6 +16,7 @@ export type RealtimeDebugEvent =
   | "ai_response_done"
   | "ai_audio_started"
   | "ai_audio_completed"
+  | "ai_audio_cleared"
   | "speech_started"
   | "speech_stopped"
   | "speech_started_during_ai_audio"

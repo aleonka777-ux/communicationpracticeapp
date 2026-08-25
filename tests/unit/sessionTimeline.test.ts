@@ -418,6 +418,7 @@ describe("createSessionTimeline", () => {
       "aiResponseId",
       "atMs",
       "context",
+      "countsTowardInterruption",
       "reason",
       "totalDurationMs",
       "userTurns",
@@ -426,6 +427,7 @@ describe("createSessionTimeline", () => {
       "confirmedBargeIns",
       "responseCancellations",
       "session",
+      "invariantViolations",
       "userTurnCount",
       "aiTurnCount",
       "totalUserSpeakingMs",
@@ -725,5 +727,317 @@ describe("createSessionTimeline — audible interruption vs. technical barge-in"
     // Only the audible barge-in against resp_2 produces overlap; the pre-playback one contributes none.
     expect(snapshot.session.overlapCount).toBe(1);
     expect(snapshot.overlaps[0].aiResponseId).toBe("resp_2");
+  });
+});
+
+/**
+ * Regression coverage for a production report: total_ai_speaking_ms (~156s) exceeding
+ * total_duration_ms (~102s), 153% ai_speaking_percentage, 50s/7-event overlap, and
+ * confirmed_interruption_count = 2 for one deliberate interruption. Root cause: response.cancel
+ * alone does not drain/stop the output audio buffer, so a genuinely interrupted AI turn's
+ * output_audio_buffer.stopped could arrive very late or never, leaving that turn open until
+ * finalize() closed it with the full session's elapsed time — inflating AI speaking time, causing
+ * it to overlap with nearly every later user turn, and hiding it from "preceding AI turn" searches
+ * (forcing response latency to be measured against a much older, unrelated turn instead). Fixed by
+ * also sending/handling output_audio_buffer.clear/.cleared, and by closing any AI turn still open
+ * when response.done arrives with a non-"completed" status. Separately, repeated confirmed
+ * barge-ins against the same still-active AI response (VAD segmenting one interruption into two
+ * raw utterances, or the same staying-open bug letting a second raw confirmation land) are now
+ * idempotent per AI response for the coaching-facing interruption count.
+ */
+describe("createSessionTimeline — AI turn lifecycle integrity", () => {
+  it("records several sequential AI turns without any overlapping intervals", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    for (let i = 1; i <= 4; i++) {
+      timeline.recordResponseCreated(`resp_${i}`);
+      clock.advance(150);
+      timeline.recordAiAudioStarted(`resp_${i}`);
+      clock.advance(3000);
+      timeline.recordAiAudioStopped(`resp_${i}`);
+      timeline.recordResponseDone(`resp_${i}`, "completed");
+      clock.advance(2000); // gap for a user turn in between, not modeled here
+    }
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.aiTurns).toHaveLength(4);
+    expect(snapshot.invariantViolations).toEqual([]);
+    expect(snapshot.session.totalAiSpeakingMs).toBeLessThanOrEqual(snapshot.session.totalDurationMs);
+  });
+
+  it("closes an interrupted AI turn promptly via output_audio_buffer.cleared, so a new AI response afterward does not overlap it", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    // resp_1 starts playing, gets interrupted 1s in.
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(100);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(1000);
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+    timeline.recordResponseCancelled("resp_1", "confirmed_bargein");
+    // The client also sends output_audio_buffer.clear — the server confirms with .cleared shortly after.
+    clock.advance(20);
+    timeline.recordAiAudioCleared("resp_1");
+    timeline.recordResponseDone("resp_1", "cancelled");
+    clock.advance(300);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Hold on, let me say something.");
+
+    // A brand new AI response plays afterward, much later.
+    clock.advance(5000);
+    timeline.recordResponseCreated("resp_2");
+    clock.advance(150);
+    timeline.recordAiAudioStarted("resp_2");
+    clock.advance(4000);
+    timeline.recordAiAudioStopped("resp_2");
+    timeline.recordResponseDone("resp_2", "completed");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.aiTurns).toHaveLength(2);
+    const resp1 = snapshot.aiTurns.find((t) => t.responseId === "resp_1")!;
+    // Closed promptly (start 100 -> end 1370, NOT dragged out to session end).
+    expect(resp1.endMs).toBe(1370);
+    expect(resp1.durationMs).toBe(1270);
+    expect(resp1.wasInterrupted).toBe(true);
+    expect(snapshot.invariantViolations).toEqual([]);
+  });
+
+  it("treats a late output_audio_buffer.stopped after cancellation as a no-op, not a reopened/extended turn", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(100);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(500);
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+    clock.advance(20);
+    timeline.recordAiAudioCleared("resp_1"); // closes the turn at 870ms
+    timeline.recordResponseDone("resp_1", "cancelled");
+
+    // A residual output_audio_buffer.stopped arrives much later (whatever tiny bit of buffered
+    // audio finally finished draining) — must not reopen or extend the already-closed turn.
+    clock.advance(4000);
+    timeline.recordAiAudioStopped("resp_1");
+
+    clock.advance(200);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Wait, stop.");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.aiTurns).toHaveLength(1);
+    expect(snapshot.aiTurns[0].endMs).toBe(870);
+    expect(snapshot.aiTurns[0].durationMs).toBe(770);
+  });
+
+  it("ignores stale/duplicate Realtime events without double-counting or corrupting the timeline", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    timeline.recordResponseCreated("resp_1"); // duplicate created
+    clock.advance(150);
+    timeline.recordAiAudioStarted("resp_1");
+    timeline.recordAiAudioStarted("resp_1"); // duplicate started
+    clock.advance(2000);
+    timeline.recordAiAudioCleared("resp_1");
+    timeline.recordAiAudioCleared("resp_1"); // duplicate cleared
+    timeline.recordAiAudioStopped("resp_1"); // duplicate via the other event name too
+    timeline.recordResponseDone("resp_1", "cancelled");
+    timeline.recordResponseDone("resp_1", "cancelled"); // duplicate done
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.aiTurns).toHaveLength(1);
+    expect(snapshot.aiTurns[0].durationMs).toBe(2000);
+    expect(snapshot.invariantViolations).toEqual([]);
+  });
+
+  it("counts one real audible interruption exactly once even when the server's VAD reports it as two raw speech segments", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(100);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(1000);
+
+    // First raw segment of the user's interruption confirms.
+    timeline.recordUserSpeechStarted("item_1a");
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+
+    // A brief natural pause mid-utterance: VAD reports speech_stopped then speech_started again for
+    // what the user experiences as one continuous interruption of the SAME still-active response.
+    clock.advance(50);
+    timeline.recordUserSpeechStopped("item_1a");
+    timeline.recordUserTranscript("item_1a", "Wait");
+    clock.advance(30);
+    timeline.recordUserSpeechStarted("item_1b");
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn(); // fires again against the same still-open resp_1
+
+    clock.advance(20);
+    timeline.recordAiAudioCleared("resp_1");
+    timeline.recordResponseDone("resp_1", "cancelled");
+    clock.advance(300);
+    timeline.recordUserSpeechStopped("item_1b");
+    timeline.recordUserTranscript("item_1b", "let me finish this thought.");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.confirmedBargeIns).toHaveLength(2);
+    expect(snapshot.session.technicalBargeInCount).toBe(2);
+    // Exactly one counted audible interruption for the coaching-facing metric.
+    expect(snapshot.session.confirmedInterruptionCount).toBe(1);
+    expect(snapshot.confirmedBargeIns[0].countsTowardInterruption).toBe(true);
+    expect(snapshot.confirmedBargeIns[1].countsTowardInterruption).toBe(false);
+  });
+
+  it("does not let a false echo event become a second coaching-facing interruption", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    // A genuine, confirmed interruption of resp_1.
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(100);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(800);
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+    clock.advance(20);
+    timeline.recordAiAudioCleared("resp_1");
+    timeline.recordResponseDone("resp_1", "cancelled");
+    clock.advance(300);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Actually, wait.");
+
+    // Later, a new AI turn plays, and a brief echo blip occurs during it — never confirmed by the
+    // barge-in controller (no recordConfirmedBargeIn call), so it must never inflate the
+    // coaching-facing count no matter what transcript text it happens to produce.
+    clock.advance(1000);
+    timeline.recordResponseCreated("resp_2");
+    clock.advance(150);
+    timeline.recordAiAudioStarted("resp_2");
+    clock.advance(500);
+    timeline.recordUserSpeechStarted("item_echo");
+    clock.advance(60);
+    timeline.recordUserSpeechStopped("item_echo"); // stops before confirmation - a blip, no barge-in
+    clock.advance(2000);
+    timeline.recordAiAudioStopped("resp_2");
+    timeline.recordResponseDone("resp_2", "completed");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.session.confirmedInterruptionCount).toBe(1);
+    expect(snapshot.session.technicalBargeInCount).toBe(1);
+    const echoTurn = snapshot.userTurns.find((t) => t.itemId === "item_echo")!;
+    expect(echoTurn.classification).toBe("suspected_noise");
+  });
+
+  it("keeps AI speaking time within session duration for a normal multi-turn single-stream conversation", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    // Opening line.
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(100);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(3000);
+    timeline.recordAiAudioStopped("resp_1");
+    timeline.recordResponseDone("resp_1", "completed");
+
+    // Three ordinary user <-> AI exchanges.
+    for (let i = 2; i <= 4; i++) {
+      clock.advance(800);
+      timeline.recordUserSpeechStarted(`item_${i}`);
+      clock.advance(2500);
+      timeline.recordUserSpeechStopped(`item_${i}`);
+      timeline.recordUserTranscript(`item_${i}`, "A normal reply.");
+
+      clock.advance(600);
+      timeline.recordResponseCreated(`resp_${i}`);
+      clock.advance(150);
+      timeline.recordAiAudioStarted(`resp_${i}`);
+      clock.advance(3200);
+      timeline.recordAiAudioStopped(`resp_${i}`);
+      timeline.recordResponseDone(`resp_${i}`, "completed");
+    }
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.session.totalAiSpeakingMs).toBeLessThanOrEqual(snapshot.session.totalDurationMs);
+    expect(snapshot.session.aiSpeakingPercentage).toBeGreaterThanOrEqual(0);
+    expect(snapshot.session.aiSpeakingPercentage).toBeLessThanOrEqual(100);
+    expect(snapshot.session.userSpeakingPercentage).toBeGreaterThanOrEqual(0);
+    expect(snapshot.session.userSpeakingPercentage).toBeLessThanOrEqual(100);
+    expect(snapshot.invariantViolations).toEqual([]);
+  });
+
+  it("bounds total overlap by both total user speaking time and total AI speaking time", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(100);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(1000);
+    // Genuine overlap: user speaks over the last portion of resp_1's playback.
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(300);
+    timeline.recordAiAudioStopped("resp_1");
+    timeline.recordResponseDone("resp_1", "completed");
+    clock.advance(500);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "I wanted to add something.");
+
+    const snapshot = timeline.finalize();
+    const maxAllowedOverlap = Math.min(snapshot.session.totalUserSpeakingMs, snapshot.session.totalAiSpeakingMs);
+    expect(snapshot.session.totalOverlapMs).toBeLessThanOrEqual(maxAllowedOverlap);
+    expect(snapshot.invariantViolations).toEqual([]);
+  });
+
+  it("pairs response latency with the correct immediately-preceding audible AI turn, not a stale earlier one", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    // An earlier AI turn gets interrupted and closes promptly (the fix under test).
+    timeline.recordResponseCreated("resp_1");
+    clock.advance(100);
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(1000);
+    timeline.recordUserSpeechStarted("item_interrupt");
+    clock.advance(250);
+    timeline.recordConfirmedBargeIn();
+    clock.advance(20);
+    timeline.recordAiAudioCleared("resp_1"); // resp_1 ends at 1370ms
+    timeline.recordResponseDone("resp_1", "cancelled");
+    clock.advance(300);
+    timeline.recordUserSpeechStopped("item_interrupt");
+    timeline.recordUserTranscript("item_interrupt", "Wait, let me say this.");
+
+    // The AI's actual reply to the interruption plays out fully afterward.
+    clock.advance(400);
+    timeline.recordResponseCreated("resp_2");
+    clock.advance(150);
+    timeline.recordAiAudioStarted("resp_2");
+    clock.advance(2000);
+    timeline.recordAiAudioStopped("resp_2"); // resp_2 ends at 1370+300+400+150+2000 = 4220ms
+    timeline.recordResponseDone("resp_2", "completed");
+
+    // The user responds after a clean 600ms gap.
+    clock.advance(600);
+    timeline.recordUserSpeechStarted("item_reply");
+    clock.advance(1200);
+    timeline.recordUserSpeechStopped("item_reply");
+    timeline.recordUserTranscript("item_reply", "Okay, that makes sense.");
+
+    const snapshot = timeline.finalize();
+    // Latency must be measured against resp_2 (the turn the user actually heard just before
+    // replying), not resp_1 (which ended much earlier and is unrelated to this exchange).
+    expect(snapshot.session.avgUserResponseLatencyMs).toBe(600);
   });
 });

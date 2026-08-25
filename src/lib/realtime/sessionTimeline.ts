@@ -56,6 +56,41 @@
  * objective intersection of a confirmed user-speech interval and an actual AI-playback interval,
  * regardless of which barge-in context (if any) accompanied it.
  *
+ * Closing an AI turn reliably — the actual root cause of AI-speaking-time/overlap/latency blowups
+ * seen in production (total_ai_speaking_ms exceeding total_duration_ms, huge spurious overlap,
+ * wildly inflated response latency): `response.cancel` alone stops the server from generating
+ * further content but does NOT itself drain/stop the OUTPUT AUDIO BUFFER — only an explicit
+ * `output_audio_buffer.clear` event (client -> server) or the server's own VAD-mode auto-interrupt
+ * (which requires `turn_detection.interrupt_response: true`, disabled here on purpose) does that.
+ * The component previously sent `response.cancel` alone on a confirmed barge-in, so a genuinely
+ * interrupted response's `output_audio_buffer.stopped` could arrive very late or never at all,
+ * leaving that AiTurnMetric open until `finalize()`, where it would be closed with `finalizedAtMs`
+ * — giving it a duration spanning most or all of the remaining session. That single bad interval
+ * then (a) inflates `totalAiSpeakingMs` past the session's own wall-clock duration, (b) overlaps
+ * with essentially every subsequent user turn, inflating overlap count/duration, and (c) gets
+ * excluded from "preceding AI turn" searches for response latency (its endMs is too late to
+ * qualify as "preceding" anything), forcing latency to be measured against a much older, unrelated
+ * AI turn instead. Fixed two ways: (1) the component now also sends `output_audio_buffer.clear`
+ * alongside `response.cancel`, and listens for the resulting `output_audio_buffer.cleared` event,
+ * closing the AI turn exactly like `.stopped` would; (2) as a safety net independent of that fix,
+ * `recordResponseDone()` now closes any AI turn that is still open when the response concludes
+ * with any status other than `"completed"` (cancelled/failed/incomplete) — those statuses can never
+ * produce further audio, so there is nothing to keep waiting for. Both paths funnel through one
+ * idempotent close, so whichever event arrives first wins and the other is a safe no-op.
+ *
+ * Idempotent audible interruption per AI response: a single deliberate user interruption can
+ * legitimately generate more than one raw `speech_started`/`speech_stopped` pair from the server's
+ * VAD (a brief pause mid-utterance splits it into two segments), and — before the fix above — a
+ * genuinely interrupted response staying artificially "open" could also let a second raw
+ * confirmation land against the same still-apparently-active response. Either way, multiple
+ * confirmed barge-ins against the SAME AI response represent one underlying interruption of one AI
+ * turn, not several. `recordConfirmedBargeIn()` tracks which AI response ids have already produced
+ * a counted audible interruption; a repeat confirmation against an already-counted response is
+ * still recorded in full (`ConfirmedBargeInMetric`, `technicalBargeInCount`) for diagnostics, but
+ * is marked `countsTowardInterruption: false` and excluded from `confirmedInterruptionCount`. This
+ * does not assume a transcript proves genuine speech either way — the dedup key is the interrupted
+ * AI response, not anything transcript-derived.
+ *
  * User-speech-event classification: a raw `speech_started` -> `speech_stopped` pair is NOT by
  * itself evidence that a real user communication turn occurred — production testing has confirmed
  * false `speech_started` events from speaker echo. Every such event is classified as either
@@ -137,6 +172,11 @@ export interface ConfirmedBargeInMetric {
   atMs: number;
   aiResponseId: string | null;
   context: BargeInContext;
+  /** False when this is a repeat confirmation against an AI response that has already produced a
+   *  counted audible interruption (or when context is "pre_playback") — see the module doc comment
+   *  on idempotent audible interruption. Every event is still recorded here regardless, for
+   *  diagnostics; only entries with this true count toward SessionLevelMetrics.confirmedInterruptionCount. */
+  countsTowardInterruption: boolean;
 }
 
 export interface ResponseCancelledMetric {
@@ -184,6 +224,12 @@ export interface SessionTimelineSnapshot {
   confirmedBargeIns: ConfirmedBargeInMetric[];
   responseCancellations: ResponseCancelledMetric[];
   session: SessionLevelMetrics;
+  /** Human-readable descriptions of any structural invariant violated by this snapshot (e.g. AI
+   *  speaking time exceeding session duration, overlapping AI turns) — see
+   *  validateSessionTimelineInvariants(). Empty in the normal case. Diagnostic only: never persisted,
+   *  never used to silently clamp/reject data — a violation means the underlying event lifecycle
+   *  has a bug that needs fixing, not that the number should be capped. */
+  invariantViolations: string[];
 }
 
 interface MutableUserTurn {
@@ -226,7 +272,15 @@ export interface SessionTimeline {
    *  yet — see the module doc comment on the response.created -> output_audio_buffer.started gap. */
   recordResponseCreated(responseId: string): void;
   recordAiAudioStarted(responseId: string): void;
+  /** The output audio buffer naturally drained (response completed normally, or already-queued
+   *  audio finished playing out after a cancellation). Closes the AI turn if not already closed. */
   recordAiAudioStopped(responseId: string): void;
+  /** The output audio buffer was explicitly cleared (client-sent output_audio_buffer.clear, or the
+   *  server's own VAD-mode auto-clear) — the server-confirmed signal that this response's audio
+   *  has stopped reaching the client because it was cut off, not because it finished. Closes the AI
+   *  turn exactly like recordAiAudioStopped if not already closed — see the module doc comment on
+   *  closing an AI turn reliably. */
+  recordAiAudioCleared(responseId: string): void;
   recordAiTranscript(responseId: string, transcript: string): void;
   recordResponseDone(responseId: string, status: AiResponseStatus): void;
   recordConfirmedBargeIn(): void;
@@ -267,6 +321,61 @@ function classifyUserSpeechEvent(turn: {
   return turn.durationMs >= AMBIGUOUS_NO_TRANSCRIPT_MIN_MS ? "confirmed" : "suspected_noise";
 }
 
+function intervalsOverlap(a: { startMs: number; endMs: number }, b: { startMs: number; endMs: number }): boolean {
+  return Math.max(a.startMs, b.startMs) < Math.min(a.endMs, b.endMs);
+}
+
+/**
+ * Structural sanity checks over a finalized snapshot — never used to clamp/reject the data, only to
+ * surface a lifecycle bug loudly (console.error in finalize()) so it's fixed at the source rather
+ * than papered over. This product never plays more than one AI audio stream at a time and a user
+ * cannot speak two turns at once, so every check below should always pass; a violation means an
+ * event-lifecycle bug like the one described in the module doc comment ("Closing an AI turn
+ * reliably"), not a legitimate edge case to accommodate.
+ */
+function validateSessionTimelineInvariants(params: {
+  session: SessionLevelMetrics;
+  aiTurns: AiTurnMetric[];
+  confirmedUserTurns: UserTurnMetric[];
+}): string[] {
+  const { session, aiTurns, confirmedUserTurns } = params;
+  const violations: string[] = [];
+
+  if (session.totalAiSpeakingMs > session.totalDurationMs) {
+    violations.push(
+      `total_ai_speaking_ms (${session.totalAiSpeakingMs}) exceeds total_duration_ms (${session.totalDurationMs}) — this product never plays multiple AI audio streams at once.`,
+    );
+  }
+  if (session.userSpeakingPercentage < 0 || session.userSpeakingPercentage > 100) {
+    violations.push(`user_speaking_percentage (${session.userSpeakingPercentage}) is outside [0, 100].`);
+  }
+  if (session.aiSpeakingPercentage < 0 || session.aiSpeakingPercentage > 100) {
+    violations.push(`ai_speaking_percentage (${session.aiSpeakingPercentage}) is outside [0, 100].`);
+  }
+  const maxAllowedOverlapMs = Math.min(session.totalUserSpeakingMs, session.totalAiSpeakingMs);
+  if (session.totalOverlapMs > maxAllowedOverlapMs) {
+    violations.push(
+      `total_overlap_ms (${session.totalOverlapMs}) exceeds min(total_user_speaking_ms, total_ai_speaking_ms) = ${maxAllowedOverlapMs}.`,
+    );
+  }
+  for (let i = 0; i < aiTurns.length; i++) {
+    for (let j = i + 1; j < aiTurns.length; j++) {
+      if (intervalsOverlap(aiTurns[i], aiTurns[j])) {
+        violations.push(`AI turns ${aiTurns[i].responseId} and ${aiTurns[j].responseId} have overlapping intervals.`);
+      }
+    }
+  }
+  for (let i = 0; i < confirmedUserTurns.length; i++) {
+    for (let j = i + 1; j < confirmedUserTurns.length; j++) {
+      if (intervalsOverlap(confirmedUserTurns[i], confirmedUserTurns[j])) {
+        violations.push(`User turns ${confirmedUserTurns[i].itemId} and ${confirmedUserTurns[j].itemId} have overlapping intervals.`);
+      }
+    }
+  }
+
+  return violations;
+}
+
 export function createSessionTimeline(options: SessionTimelineOptions = {}): SessionTimeline {
   const now = options.now ?? (() => performance.now());
   const sessionStartMs = now();
@@ -288,6 +397,18 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
    *  before confirmation never reaches onConfirmedBargeIn), so this is how recordConfirmedBargeIn()
    *  attributes the confirmation back to the specific user turn that earned it. */
   let currentOpenUserItemId: string | null = null;
+  /** AI response ids that have already produced a counted audible interruption — see the module
+   *  doc comment on idempotent audible interruption. */
+  const audibleInterruptedResponseIds = new Set<string>();
+
+  /** Shared by recordAiAudioStopped/recordAiAudioCleared/recordResponseDone's safety net — closing
+   *  an AI turn is idempotent regardless of which event does it first. */
+  function closeAiTurn(responseId: string) {
+    const turn = aiTurnsByResponseId.get(responseId);
+    if (!turn || turn.endMs !== null) return;
+    turn.endMs = elapsed();
+    if (currentAiResponseId === responseId) currentAiResponseId = null;
+  }
 
   return {
     recordUserSpeechStarted(itemId, serverAudioStartMs = null) {
@@ -345,10 +466,11 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
     },
 
     recordAiAudioStopped(responseId) {
-      const turn = aiTurnsByResponseId.get(responseId);
-      if (!turn || turn.endMs !== null) return;
-      turn.endMs = elapsed();
-      if (currentAiResponseId === responseId) currentAiResponseId = null;
+      closeAiTurn(responseId);
+    },
+
+    recordAiAudioCleared(responseId) {
+      closeAiTurn(responseId);
     },
 
     recordAiTranscript(responseId, transcript) {
@@ -362,6 +484,11 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
       if (!turn) return;
       turn.responseStatus = status;
       if (status === "cancelled") turn.wasInterrupted = true;
+      // Safety net: a response that did not complete normally can never produce further audio, so
+      // if .stopped/.cleared hasn't already closed this turn, close it now rather than leaving it
+      // open until session finalize — see the module doc comment on closing an AI turn reliably.
+      // A "completed" response is left to .stopped, which may still be draining a residual buffer.
+      if (status !== "completed") closeAiTurn(responseId);
     },
 
     recordConfirmedBargeIn() {
@@ -373,7 +500,13 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
       // "audible" iff AI audio was actually playing (currentAiResponseId set); otherwise this is a
       // pre-playback cancellation — a real technical barge-in, but not an audible interruption.
       const context: BargeInContext = currentAiResponseId ? "audible" : "pre_playback";
-      confirmedBargeIns.push({ atMs: elapsed(), aiResponseId: interruptedResponseId, context });
+      // Idempotent per AI response — see the module doc comment on idempotent audible interruption.
+      const countsTowardInterruption =
+        context === "audible" && interruptedResponseId !== null && !audibleInterruptedResponseIds.has(interruptedResponseId);
+      if (context === "audible" && interruptedResponseId !== null) {
+        audibleInterruptedResponseIds.add(interruptedResponseId);
+      }
+      confirmedBargeIns.push({ atMs: elapsed(), aiResponseId: interruptedResponseId, context, countsTowardInterruption });
       const aiTurn = currentAiResponseId ? aiTurnsByResponseId.get(currentAiResponseId) : null;
       if (aiTurn) aiTurn.wasInterrupted = true;
       // A confirmed barge-in can only ever fire while the triggering user turn is still open (see
@@ -489,7 +622,6 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
       const totalUserSpeakingMs = confirmedUserTurns.reduce((sum, t) => sum + t.durationMs, 0);
       const totalAiSpeakingMs = aiTurns.reduce((sum, t) => sum + t.durationMs, 0);
       const totalOverlapMs = overlaps.reduce((sum, o) => sum + o.durationMs, 0);
-      const audibleBargeIns = confirmedBargeIns.filter((b) => b.context === "audible");
 
       const session: SessionLevelMetrics = {
         totalDurationMs: finalizedAtMs,
@@ -501,7 +633,7 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
         aiSpeakingPercentage: finalizedAtMs > 0 ? (totalAiSpeakingMs / finalizedAtMs) * 100 : 0,
         totalOverlapMs,
         overlapCount: overlaps.length,
-        confirmedInterruptionCount: audibleBargeIns.length,
+        confirmedInterruptionCount: confirmedBargeIns.filter((b) => b.countsTowardInterruption).length,
         technicalBargeInCount: confirmedBargeIns.length,
         suspectedNoiseEventCount: userTurns.length - confirmedUserTurns.length,
         avgUserTurnDurationMs: average(confirmedUserTurns.map((t) => t.durationMs)),
@@ -514,7 +646,21 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
         medianAiResponseLatencyMs: median(aiResponseLatencies),
       };
 
-      return { totalDurationMs: finalizedAtMs, userTurns, aiTurns, overlaps, confirmedBargeIns: [...confirmedBargeIns], responseCancellations: [...responseCancellations], session };
+      const invariantViolations = validateSessionTimelineInvariants({ session, aiTurns, confirmedUserTurns });
+      if (invariantViolations.length > 0) {
+        console.error("[voice:realtime:metrics] session timeline invariant violation(s) — see /docs/DECISIONS.md", invariantViolations);
+      }
+
+      return {
+        totalDurationMs: finalizedAtMs,
+        userTurns,
+        aiTurns,
+        overlaps,
+        confirmedBargeIns: [...confirmedBargeIns],
+        responseCancellations: [...responseCancellations],
+        session,
+        invariantViolations,
+      };
     },
   };
 }
@@ -550,6 +696,10 @@ export function formatSessionTimelineDebugLines(snapshot: SessionTimelineSnapsho
   lines.push(`Technical confirmed barge-in (all, incl. pre-playback): ${snapshot.session.technicalBargeInCount}`);
   lines.push(`Overlap: ${snapshot.overlaps.length} interval(s), ${toS(snapshot.session.totalOverlapMs)}s total`);
   lines.push(`Suspected false VAD/noise events excluded: ${snapshot.session.suspectedNoiseEventCount}`);
+  if (snapshot.invariantViolations.length > 0) {
+    lines.push(`INVARIANT VIOLATIONS (${snapshot.invariantViolations.length}):`);
+    for (const violation of snapshot.invariantViolations) lines.push(`  - ${violation}`);
+  }
 
   return lines;
 }

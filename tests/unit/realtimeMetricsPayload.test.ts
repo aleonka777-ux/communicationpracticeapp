@@ -189,7 +189,7 @@ describe("mapMetricsPayloadToTurnEvents", () => {
       userItemId: "item_1",
       aiResponseId: "resp_1",
     });
-    payload.confirmedBargeIns.push({ atMs: 999.9, aiResponseId: "resp_1", context: "audible" });
+    payload.confirmedBargeIns.push({ atMs: 999.9, aiResponseId: "resp_1", context: "audible", countsTowardInterruption: true });
 
     const events = mapMetricsPayloadToTurnEvents(payload);
 
@@ -209,6 +209,7 @@ describe("mapMetricsPayloadToTurnEvents", () => {
     const bargeInEvent = events.find((e) => e.kind === "confirmed_barge_in")!;
     expect(bargeInEvent.start_ms).toBe(999.9);
     expect(bargeInEvent.barge_in_context).toBe("audible");
+    expect(bargeInEvent.counts_toward_interruption).toBe(true);
   });
 
   it("keeps turn_index as a whole number while every ms field stays untouched", () => {
