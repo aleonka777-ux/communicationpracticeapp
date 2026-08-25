@@ -11,6 +11,8 @@ All six original MVP build phases plus Realtime voice Phase 1 + 2 (see `docs/BUI
 - Full architecture in `docs/DECISIONS.md` ("Realtime voice rollout") and `docs/ARCHITECTURE.md` §9.2.
 - **Off by default** — set `REALTIME_VOICE_ENABLED=true` in Vercel (alongside the already-configured `OPENAI_API_KEY`) to turn it on. Until then, every session uses the existing batch STT/TTS path unchanged.
 - Not yet exercised against a live OpenAI Realtime session in this build environment (no browser with microphone access here) — the one part of the implementation genuinely unverified end-to-end is the WebRTC SDP exchange against `https://api.openai.com/v1/realtime/calls`, which was inferred from the installed SDK's types/doc comments rather than observed working. First real test should specifically watch for this.
+- **Graceful session completion**, added just after Phase 1 + 2: ending (timer or End Practice) now cancels any in-progress AI turn, waits up to 4s for the user's last utterance to finish transcribing, and flushes queued transcript writes before `/api/practice/end` runs — see `docs/DECISIONS.md` for the two races this closes.
+- **Evaluation Engine safety guardrail**, added at the same time: the coach prompt now explicitly forbids claiming to have observed tone, pace, pauses, confidence, or any other paralinguistic/vocal signal, since only a text transcript is ever provided. No scoring, schema, or feedback-format changes — the full rubric/methodology redesign is still future work (Communication Manual / content architecture, not started).
 - Known, deliberate gaps for this phase: Training Mode hints aren't wired into the Realtime screen; no vocal/prosody analytics; no raw audio persistence.
 
 ## Completed

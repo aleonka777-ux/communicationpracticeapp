@@ -12,6 +12,7 @@ import { cn } from "@/lib/utils";
 import { computeRemainingSeconds } from "@/lib/practice/timer";
 import { transitionRealtimeConnection, type RealtimeConnectionState } from "@/lib/realtime/connectionState";
 import { connectRealtimeSession, type RealtimeConnection } from "@/lib/realtime/webrtcClient";
+import { waitForPendingUserTranscription } from "@/lib/realtime/pendingTranscription";
 
 export interface RealtimeSimulationClientProps {
   sessionId: string;
@@ -60,6 +61,7 @@ export function RealtimeSimulationClient({
   const transcriptQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const errorRetryRef = useRef<(() => void) | null>(null);
   const connectingRef = useRef(false);
+  const pendingUserTranscriptionRef = useRef(false);
 
   // Persists transcript turns one at a time — Realtime can emit the user's and the AI's
   // transcript events in quick succession, and appendMessage() assigns sequence numbers via a
@@ -79,10 +81,20 @@ export function RealtimeSimulationClient({
   const finishAndEvaluate = useCallback(async () => {
     if (endTriggeredRef.current) return;
     endTriggeredRef.current = true;
-    connectionRef.current?.close();
-    connectionRef.current = null;
-    dispatch({ type: "EVALUATION_STARTED" });
     try {
+      // Stop the AI from starting or continuing to talk right away — a no-op (harmless
+      // server-reported error, already logged non-fatally) if nothing was in progress.
+      connectionRef.current?.sendEvent({ type: "response.cancel" });
+      // Give the user's last utterance a bounded window to finish transcribing before the
+      // connection goes away, so ending right as they stop speaking doesn't silently drop it.
+      await waitForPendingUserTranscription(pendingUserTranscriptionRef);
+      connectionRef.current?.close();
+      connectionRef.current = null;
+      dispatch({ type: "EVALUATION_STARTED" });
+      // Drain any transcript writes already queued (including one just enqueued above) —
+      // appendMessage() is a read-then-write, so the final turn must be persisted before
+      // /api/practice/end reads the transcript, or it's invisible to the Evaluation Engine.
+      await transcriptQueueRef.current;
       await postJson("/api/practice/end", { sessionId });
       dispatch({ type: "EVALUATION_COMPLETE" });
       router.push(`/practice/${sessionId}/feedback`);
@@ -104,6 +116,7 @@ export function RealtimeSimulationClient({
     setPeerConnectivity("connecting");
     openingLineSentRef.current = false;
     openingLineTranscriptSkippedRef.current = false;
+    pendingUserTranscriptionRef.current = false;
 
     try {
       const { clientSecret, openingLine } = await postJson<{ clientSecret: string; openingLine: string }>(
@@ -152,13 +165,19 @@ export function RealtimeSimulationClient({
               dispatch({ type: "USER_STARTED_SPEAKING" });
               break;
             case "input_audio_buffer.speech_stopped":
+              pendingUserTranscriptionRef.current = true;
               dispatch({ type: "USER_STOPPED_SPEAKING" });
               break;
             case "conversation.item.input_audio_transcription.completed": {
+              pendingUserTranscriptionRef.current = false;
               const transcript = String(event.transcript ?? "").trim();
               if (transcript) void enqueueTranscript("user", transcript);
               break;
             }
+            case "conversation.item.input_audio_transcription.failed":
+              pendingUserTranscriptionRef.current = false;
+              console.error("[voice:realtime] user speech transcription failed (turn continues)", event.error);
+              break;
             case "output_audio_buffer.started":
               dispatch({ type: "AI_STARTED_SPEAKING" });
               break;
