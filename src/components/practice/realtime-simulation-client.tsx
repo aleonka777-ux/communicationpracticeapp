@@ -16,21 +16,10 @@ import { waitForPendingUserTranscription } from "@/lib/realtime/pendingTranscrip
 import { waitForCurrentExchangeToFinish } from "@/lib/realtime/exchangeCompletion";
 import { logFinalizationStage } from "@/lib/realtime/finalizationLog";
 import { createBargeInController, DEFAULT_BARGE_IN_CONFIRM_MS } from "@/lib/realtime/bargeIn";
+import { computeStartupConfirmMs } from "@/lib/realtime/startupGuard";
 import { logRealtimeDebugEvent } from "@/lib/realtime/debugLog";
 
 const NAVIGATION_STALL_TIMEOUT_MS = 8000;
-
-/**
- * Widened barge-in confirmation used only for the AI's first turn (the opening line). Production
- * evidence: false interruptions over speakers clustered at the very start of the conversation and
- * disappeared afterward — consistent with the browser's echo-cancellation adaptive filter not
- * having converged yet against newly-started output (it has nothing to adapt against until
- * output actually begins), and/or a freshly-opened data channel being more prone to brief
- * delivery jitter than a warmed-up one. Both point at the same fix: give the FIRST turn specifically
- * more tolerance before treating a VAD start as genuine speech, without touching the VAD threshold
- * (still 0.6, unchanged) or the normal 250ms window used for the rest of the conversation.
- */
-const STARTUP_BARGE_IN_CONFIRM_MS = 500;
 
 export interface RealtimeSimulationClientProps {
   sessionId: string;
@@ -92,7 +81,7 @@ export function RealtimeSimulationClient({
     sessionElapsedMs: number;
     sinceFirstAiAudioMs: number | null;
   } | null>(null);
-  /** True until the AI's first turn (the opening line) finishes — see STARTUP_BARGE_IN_CONFIRM_MS. */
+  /** True until the AI's first turn (the opening line) finishes — see src/lib/realtime/startupGuard.ts. */
   const isFirstAiResponseRef = useRef(true);
   const sessionMountedAtRef = useRef(Date.now());
   const firstAiAudioStartAtRef = useRef<number | null>(null);
@@ -206,7 +195,11 @@ export function RealtimeSimulationClient({
       // is exactly the acoustic-echo failure mode reported in production, so this only treats it
       // as genuine barge-in once speech has persisted for a short confirmation window.
       const bargeIn = createBargeInController({
-        confirmMs: () => (isFirstAiResponseRef.current ? STARTUP_BARGE_IN_CONFIRM_MS : DEFAULT_BARGE_IN_CONFIRM_MS),
+        confirmMs: () => {
+          if (!isFirstAiResponseRef.current) return DEFAULT_BARGE_IN_CONFIRM_MS;
+          const elapsed = firstAiAudioStartAtRef.current ? Date.now() - firstAiAudioStartAtRef.current : null;
+          return computeStartupConfirmMs(elapsed);
+        },
         onImmediateSpeechStart: () => {
           dispatch({ type: "USER_STARTED_SPEAKING" });
         },
@@ -272,16 +265,19 @@ export function RealtimeSimulationClient({
                 isFirstAiResponse: isFirst,
                 sessionElapsedMs: Date.now() - sessionMountedAtRef.current,
               });
-              aiAudioSpeechIncidentRef.current = aiWasSpeaking
-                ? {
-                    startedAt: Date.now(),
-                    wasInterrupted: false,
-                    isFirstAiResponse: isFirst,
-                    confirmMsUsed: isFirst ? STARTUP_BARGE_IN_CONFIRM_MS : DEFAULT_BARGE_IN_CONFIRM_MS,
-                    sessionElapsedMs: Date.now() - sessionMountedAtRef.current,
-                    sinceFirstAiAudioMs: firstAiAudioStartAtRef.current ? Date.now() - firstAiAudioStartAtRef.current : null,
-                  }
-                : null;
+              if (aiWasSpeaking) {
+                const sinceFirstAiAudioMs = firstAiAudioStartAtRef.current ? Date.now() - firstAiAudioStartAtRef.current : null;
+                aiAudioSpeechIncidentRef.current = {
+                  startedAt: Date.now(),
+                  wasInterrupted: false,
+                  isFirstAiResponse: isFirst,
+                  confirmMsUsed: isFirst ? computeStartupConfirmMs(sinceFirstAiAudioMs) : DEFAULT_BARGE_IN_CONFIRM_MS,
+                  sessionElapsedMs: Date.now() - sessionMountedAtRef.current,
+                  sinceFirstAiAudioMs,
+                };
+              } else {
+                aiAudioSpeechIncidentRef.current = null;
+              }
               bargeIn.handleSpeechStarted();
               break;
             }
