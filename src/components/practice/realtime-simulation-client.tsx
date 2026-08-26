@@ -24,6 +24,11 @@ import {
   type AiResponseStatus,
   type SessionTimeline,
 } from "@/lib/realtime/sessionTimeline";
+import { createSpeechDeliveryTracker, type SpeechDeliveryTracker } from "@/lib/realtime/speechDeliveryTracker";
+import { startMicEnergyMonitor, type MicEnergyMonitorHandle } from "@/lib/realtime/micEnergyMonitor";
+import { formatSpeechDeliveryDebugLines } from "@/lib/realtime/speechDeliveryDebug";
+import { mergeSpeechDeliveryEvidence } from "@/lib/realtime/mergeSpeechDeliveryEvidence";
+import type { MetricsPayload } from "@/lib/realtime/metricsPayload";
 
 const NAVIGATION_STALL_TIMEOUT_MS = 8000;
 
@@ -103,6 +108,14 @@ export function RealtimeSimulationClient({
    *  once at mount), not per WebRTC connection attempt, since a reconnect is a technical hiccup,
    *  not a new session from the user's or the metrics' point of view. See sessionTimeline.ts. */
   const metricsRef = useRef<SessionTimeline | null>(null);
+  /** Phase 4A speech-delivery evidence (pauses, relative intensity) — same session-spanning
+   *  lifetime as metricsRef, for the same reason (a reconnect is a technical hiccup, not a new
+   *  session). See speechDeliveryTracker.ts. */
+  const speechDeliveryRef = useRef<SpeechDeliveryTracker | null>(null);
+  /** The live mic-energy analyser for the CURRENT WebRTC connection attempt — stopped and replaced
+   *  on every reconnect (mirrors bargeInRef's own doc comment: a stale one must never keep feeding
+   *  samples after its underlying connection/stream is gone). */
+  const micMonitorRef = useRef<MicEnergyMonitorHandle | null>(null);
 
   useEffect(() => {
     stateRef.current = state;
@@ -156,25 +169,39 @@ export function RealtimeSimulationClient({
 
         connectionRef.current?.close();
         connectionRef.current = null;
+        micMonitorRef.current?.stop();
+        micMonitorRef.current = null;
         logStage("realtime_closed");
 
-        // Finalize and best-effort persist the objective timing/interruption measurement layer.
-        // Deliberately isolated in its own try/catch: a metrics failure must never block or affect
-        // the transcript flush / /api/practice/end call below (see /docs/DECISIONS.md).
+        // Finalize and best-effort persist the objective timing/interruption measurement layer,
+        // plus Phase 4A's speech-delivery evidence (speaking rate, pauses, filler candidates,
+        // relative intensity). Deliberately isolated in its own try/catch: a metrics/evidence
+        // failure must never block or affect the transcript flush / /api/practice/end call below
+        // (see /docs/DECISIONS.md).
         try {
           const snapshot = metricsRef.current?.finalize() ?? null;
+          const deliverySnapshot = speechDeliveryRef.current?.finalize() ?? { pauses: [], turnIntensity: [] };
           if (snapshot) {
+            const { userTurns, pauses, sessionPauseAggregates } = mergeSpeechDeliveryEvidence(snapshot, deliverySnapshot);
+
             for (const line of formatSessionTimelineDebugLines(snapshot)) {
               console.debug("[voice:realtime:metrics]", line);
             }
-            await postJson("/api/simulation/realtime/metrics", {
+            for (const line of formatSpeechDeliveryDebugLines(userTurns, pauses, snapshot.fillerCandidates)) {
+              console.debug("[voice:realtime:speech-delivery]", line);
+            }
+
+            const payload: MetricsPayload = {
               sessionId,
-              userTurns: snapshot.userTurns,
+              userTurns,
               aiTurns: snapshot.aiTurns,
               overlaps: snapshot.overlaps,
               confirmedBargeIns: snapshot.confirmedBargeIns,
-              session: snapshot.session,
-            });
+              pauses,
+              fillerCandidates: snapshot.fillerCandidates,
+              session: { ...snapshot.session, ...sessionPauseAggregates },
+            };
+            await postJson("/api/simulation/realtime/metrics", payload);
           }
         } catch (error) {
           console.error(
@@ -229,6 +256,11 @@ export function RealtimeSimulationClient({
     // Cancel any still-pending confirmation timer from a previous, now-abandoned connection attempt
     // before creating a new bargeIn controller for this one — see bargeInRef's own doc comment.
     bargeInRef.current?.reset();
+    // Same reasoning as bargeInRef — a previous connection attempt's mic-energy monitor must not
+    // keep pushing samples into the (session-spanning) speechDeliveryRef after its own stream/
+    // AudioContext is gone.
+    micMonitorRef.current?.stop();
+    micMonitorRef.current = null;
 
     try {
       const { clientSecret, openingLine } = await postJson<{ clientSecret: string; openingLine: string }>(
@@ -326,6 +358,7 @@ export function RealtimeSimulationClient({
                 String(event.item_id ?? ""),
                 typeof event.audio_start_ms === "number" ? event.audio_start_ms : null,
               );
+              speechDeliveryRef.current?.openTurn(String(event.item_id ?? ""));
               if (aiWasSpeaking) {
                 const sinceFirstAiAudioMs = firstAiAudioStartAtRef.current ? Date.now() - firstAiAudioStartAtRef.current : null;
                 aiAudioSpeechIncidentRef.current = {
@@ -361,6 +394,7 @@ export function RealtimeSimulationClient({
                 String(event.item_id ?? ""),
                 typeof event.audio_end_ms === "number" ? event.audio_end_ms : null,
               );
+              speechDeliveryRef.current?.closeTurn(String(event.item_id ?? ""));
               bargeIn.handleSpeechStopped();
               break;
             }
@@ -482,6 +516,18 @@ export function RealtimeSimulationClient({
       });
 
       connectionRef.current = connection;
+
+      // Phase 4A: attach the live mic-energy analyser to this connection's own local stream. Never
+      // the remote/AI audio — see micEnergyMonitor.ts's doc comment on what it does and does not
+      // touch. Best-effort: a failure here (e.g. Web Audio unsupported) must not break the voice
+      // conversation itself, only leave pause/intensity evidence absent for this connection.
+      try {
+        micMonitorRef.current = startMicEnergyMonitor(connection.localStream, (rms) => {
+          speechDeliveryRef.current?.pushEnergySample(rms);
+        });
+      } catch (error) {
+        console.error("[voice:realtime] mic energy monitor failed to start (conversation unaffected)", error instanceof Error ? error.message : error);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Couldn't start the voice conversation.";
       setErrorMessage(message);
@@ -500,11 +546,14 @@ export function RealtimeSimulationClient({
 
   useEffect(() => {
     metricsRef.current = createSessionTimeline();
+    speechDeliveryRef.current = createSpeechDeliveryTracker();
     void connect();
     return () => {
       connectionRef.current?.close();
       connectionRef.current = null;
       bargeInRef.current?.reset();
+      micMonitorRef.current?.stop();
+      micMonitorRef.current = null;
       // This component unmounts when navigation away actually lands — logging here (rather than
       // right after router.push) is what tells us navigation genuinely completed, as opposed to
       // silently stalling with the old page still mounted (see navigationStalled below).

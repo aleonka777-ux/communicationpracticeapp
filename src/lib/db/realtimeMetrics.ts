@@ -1,8 +1,16 @@
 import type { PostgrestError, SupabaseClient } from "@supabase/supabase-js";
-import type { Database, RealtimeSessionMetricsRow, RealtimeTurnEventRow } from "@/lib/db/types";
+import type {
+  Database,
+  RealtimeDisfluencyCandidateRow,
+  RealtimePauseEventRow,
+  RealtimeSessionMetricsRow,
+  RealtimeTurnEventRow,
+} from "@/lib/db/types";
 
 export type RealtimeTurnEventInput = Omit<RealtimeTurnEventRow, "id" | "session_id" | "created_at">;
 export type RealtimeSessionMetricsInput = Omit<RealtimeSessionMetricsRow, "id" | "session_id" | "computed_at">;
+export type RealtimePauseEventInput = Omit<RealtimePauseEventRow, "id" | "session_id" | "created_at">;
+export type RealtimeDisfluencyCandidateInput = Omit<RealtimeDisfluencyCandidateRow, "id" | "session_id" | "created_at">;
 
 /**
  * Postgres reports a type-mismatch error (e.g. 22P02, "invalid input syntax for type integer")
@@ -75,6 +83,50 @@ export async function getRealtimeSessionMetrics(
   return data;
 }
 
+/** Same idempotent delete-then-insert pattern as saveRealtimeTurnEvents — see its doc comment. */
+export async function saveRealtimePauseEvents(
+  supabase: SupabaseClient<Database>,
+  sessionId: string,
+  events: RealtimePauseEventInput[],
+): Promise<void> {
+  const { error: deleteError } = await supabase.from("realtime_pause_events").delete().eq("session_id", sessionId);
+  if (deleteError) {
+    logPersistenceFailure("realtime_pause_events delete", sessionId, deleteError);
+    throw deleteError;
+  }
+
+  if (events.length === 0) return;
+
+  const rows = events.map((event) => ({ ...event, session_id: sessionId }));
+  const { error: insertError } = await supabase.from("realtime_pause_events").insert(rows);
+  if (insertError) {
+    logPersistenceFailure("realtime_pause_events insert", sessionId, insertError, rows);
+    throw insertError;
+  }
+}
+
+/** Same idempotent delete-then-insert pattern as saveRealtimeTurnEvents — see its doc comment. */
+export async function saveRealtimeDisfluencyCandidates(
+  supabase: SupabaseClient<Database>,
+  sessionId: string,
+  candidates: RealtimeDisfluencyCandidateInput[],
+): Promise<void> {
+  const { error: deleteError } = await supabase.from("realtime_disfluency_candidates").delete().eq("session_id", sessionId);
+  if (deleteError) {
+    logPersistenceFailure("realtime_disfluency_candidates delete", sessionId, deleteError);
+    throw deleteError;
+  }
+
+  if (candidates.length === 0) return;
+
+  const rows = candidates.map((candidate) => ({ ...candidate, session_id: sessionId }));
+  const { error: insertError } = await supabase.from("realtime_disfluency_candidates").insert(rows);
+  if (insertError) {
+    logPersistenceFailure("realtime_disfluency_candidates insert", sessionId, insertError, rows);
+    throw insertError;
+  }
+}
+
 export async function listRealtimeTurnEvents(
   supabase: SupabaseClient<Database>,
   sessionId: string,
@@ -84,6 +136,36 @@ export async function listRealtimeTurnEvents(
     .select("*")
     .eq("session_id", sessionId)
     .order("start_ms", { ascending: true });
+  if (error) throw error;
+  return data ?? [];
+}
+
+/** Debug/QA use — see /docs/DECISIONS.md "Phase 4A: speech-delivery evidence" for the inspection
+ *  procedure this supports. */
+export async function listRealtimePauseEvents(
+  supabase: SupabaseClient<Database>,
+  sessionId: string,
+): Promise<RealtimePauseEventRow[]> {
+  const { data, error } = await supabase
+    .from("realtime_pause_events")
+    .select("*")
+    .eq("session_id", sessionId)
+    .order("start_ms", { ascending: true });
+  if (error) throw error;
+  return data ?? [];
+}
+
+/** Debug/QA use — see /docs/DECISIONS.md "Phase 4A: speech-delivery evidence" for the inspection
+ *  procedure this supports. */
+export async function listRealtimeDisfluencyCandidates(
+  supabase: SupabaseClient<Database>,
+  sessionId: string,
+): Promise<RealtimeDisfluencyCandidateRow[]> {
+  const { data, error } = await supabase
+    .from("realtime_disfluency_candidates")
+    .select("*")
+    .eq("session_id", sessionId)
+    .order("approx_session_ms", { ascending: true, nullsFirst: false });
   if (error) throw error;
   return data ?? [];
 }

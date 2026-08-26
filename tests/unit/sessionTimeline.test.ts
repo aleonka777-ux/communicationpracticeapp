@@ -448,6 +448,28 @@ describe("createSessionTimeline", () => {
       "longestUserResponseLatencyMs",
       "avgAiResponseLatencyMs",
       "medianAiResponseLatencyMs",
+      // Phase 4A: speech-delivery evidence — see sessionTimeline.ts's doc comment. All neutral
+      // counts/rates/positions/short text snippets — never raw audio.
+      "wordCount",
+      "speakingRateWpm",
+      "avgWordsPerMinute",
+      "medianWordsPerMinute",
+      "fastestUserTurnWpm",
+      "slowestUserTurnWpm",
+      "wpmTrendSlopePerTurn",
+      "vocalDisfluencyCandidateCount",
+      "lexicalDiscourseCandidateCount",
+      "repetitionCandidateCount",
+      "candidateRatePer100Words",
+      "candidateRatePerMinuteSpeaking",
+      "fillerCandidates",
+      "phrase",
+      "category",
+      "transcriptStartChar",
+      "transcriptEndChar",
+      "contextBefore",
+      "contextAfter",
+      "approxSessionMs",
     ]);
 
     function assertNoAudioFields(value: unknown): void {
@@ -1369,5 +1391,155 @@ describe("createSessionTimeline — media/data-channel ordering race reconciliat
     expect(snapshot.session.overlapCount).toBe(0);
     expect(snapshot.session.totalOverlapMs).toBe(0);
     expect(snapshot.aiTurns).toHaveLength(0); // no phantom AI turn for audio that never played
+  });
+});
+
+describe("createSessionTimeline — Phase 4A speaking rate (WPM)", () => {
+  it("computes word count and WPM for a normal confirmed turn", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(4000); // 4 seconds
+    timeline.recordUserSpeechStopped("item_1");
+    // 8 words in 4 seconds = 120 WPM
+    timeline.recordUserTranscript("item_1", "I think we should meet again next week");
+
+    const snapshot = timeline.finalize();
+    const turn = snapshot.userTurns[0];
+    expect(turn.wordCount).toBe(8);
+    expect(turn.speakingRateWpm).toBeCloseTo(120, 5);
+    expect(snapshot.session.avgWordsPerMinute).toBeCloseTo(120, 5);
+  });
+
+  it("excludes a suspected-noise turn from every WPM aggregate", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    // A confirmed turn with a real rate.
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(2000);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Yes I can do that for you");
+
+    // A suspected-noise event: empty transcript, short duration, no barge-in.
+    clock.advance(500);
+    timeline.recordUserSpeechStarted("item_2");
+    clock.advance(100);
+    timeline.recordUserSpeechStopped("item_2");
+    timeline.recordUserTranscript("item_2", "");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.userTurns.find((t) => t.itemId === "item_2")?.classification).toBe("suspected_noise");
+    expect(snapshot.userTurns.find((t) => t.itemId === "item_2")?.wordCount).toBe(0);
+    // Only item_1 contributes to the session aggregate.
+    expect(snapshot.session.avgWordsPerMinute).not.toBeNull();
+    expect(snapshot.session.fastestUserTurnWpm).toBe(snapshot.session.slowestUserTurnWpm);
+  });
+
+  it("treats a genuine short turn (below MIN_WORDS_FOR_RATE) as having no meaningful rate, without discarding the turn itself", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(400);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Okay."); // 1 word — genuine confirmed turn, just too short for a rate
+
+    const snapshot = timeline.finalize();
+    const turn = snapshot.userTurns[0];
+    expect(turn.classification).toBe("confirmed"); // still a real turn
+    expect(turn.wordCount).toBe(1);
+    expect(turn.speakingRateWpm).toBeNull(); // but no rate manufactured from it
+    expect(snapshot.session.avgWordsPerMinute).toBeNull(); // no qualifying turns at all
+  });
+
+  it("computes a WPM trend slope only once at least 3 qualifying turns exist", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    function turn(itemId: string, transcript: string, durationMs: number) {
+      timeline.recordUserSpeechStarted(itemId);
+      clock.advance(durationMs);
+      timeline.recordUserSpeechStopped(itemId);
+      timeline.recordUserTranscript(itemId, transcript);
+      clock.advance(300);
+    }
+
+    turn("item_1", "one two three four five six", 3000); // 120 WPM
+    let snapshot = timeline.finalize();
+    // Only exercised via a second timeline for the "not enough points yet" case below.
+    expect(snapshot.session.wpmTrendSlopePerTurn).toBeNull();
+
+    const clock2 = createClock();
+    const timeline2 = createSessionTimeline({ now: clock2.now });
+    function turn2(itemId: string, transcript: string, durationMs: number) {
+      timeline2.recordUserSpeechStarted(itemId);
+      clock2.advance(durationMs);
+      timeline2.recordUserSpeechStopped(itemId);
+      timeline2.recordUserTranscript(itemId, transcript);
+      clock2.advance(300);
+    }
+    turn2("item_1", "one two three four five six", 3000);
+    turn2("item_2", "one two three four five six", 3000);
+    turn2("item_3", "one two three four five six", 3000);
+    snapshot = timeline2.finalize();
+    expect(snapshot.session.wpmTrendSlopePerTurn).not.toBeNull();
+  });
+});
+
+describe("createSessionTimeline — Phase 4A filler/disfluency candidates", () => {
+  it("derives filler candidates only from CONFIRMED turns' transcripts, attributed with turnIndex and approxSessionMs", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(2000);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Well, I um think that works.");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.fillerCandidates.length).toBeGreaterThan(0);
+    for (const c of snapshot.fillerCandidates) {
+      expect(c.itemId).toBe("item_1");
+      expect(c.turnIndex).toBe(1);
+      expect(c.classification).toBe("unclassified");
+      expect(c.approxSessionMs).not.toBeNull();
+      expect(c.approxSessionMs as number).toBeGreaterThanOrEqual(0);
+    }
+    expect(snapshot.session.vocalDisfluencyCandidateCount).toBeGreaterThan(0);
+    expect(snapshot.session.lexicalDiscourseCandidateCount).toBeGreaterThan(0);
+  });
+
+  it("never derives filler candidates from a suspected-noise turn's transcript", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    // A suspected-noise event that happens to have filler-like text is not realistic (empty/failed
+    // transcripts are what cause suspected_noise), but the exclusion is via classification filtering,
+    // not text content — verified here by transcription failure classification with no transcript.
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(100);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscriptionFailed("item_1");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.userTurns[0].classification).toBe("suspected_noise");
+    expect(snapshot.fillerCandidates).toHaveLength(0);
+  });
+
+  it("computes candidate rate per 100 words and per minute of speaking", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(60000); // 1 minute
+    timeline.recordUserSpeechStopped("item_1");
+    // 10 words, 1 filler ("um")
+    timeline.recordUserTranscript("item_1", "So um I think we should really go there today now");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.session.candidateRatePer100Words).not.toBeNull();
+    expect(snapshot.session.candidateRatePerMinuteSpeaking).not.toBeNull();
   });
 });

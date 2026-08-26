@@ -224,7 +224,61 @@ export interface RealtimeTurnEventRow {
    *  src/lib/realtime/sessionTimeline.ts's doc comment on classifying audible-vs-pre_playback at
    *  speech-start time. */
   audible_ai_response_id_at_start: string | null;
+  /** user_turn rows only. Phase 4A speech-delivery evidence — see
+   *  src/lib/realtime/sessionTimeline.ts's UserTurnMetric doc comments. Null for every other kind,
+   *  or when there was no transcript / turn was too short to compute a rate. */
+  word_count: number | null;
+  speaking_rate_wpm: number | null;
+  /** user_turn rows only. Relative/unitless RMS-derived intensity evidence — NEVER dB SPL. See
+   *  src/lib/realtime/speechDeliveryTracker.ts. Null for every other kind, or when the mic-energy
+   *  monitor produced no samples for this turn. */
+  avg_relative_intensity: number | null;
+  peak_relative_intensity: number | null;
+  intensity_variability: number | null;
   metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+/** Phase 4A: one row per detected intra-utterance pause (a period of low mic energy inside an
+ *  already-open, CONFIRMED user turn) — see src/lib/realtime/speechDeliveryTracker.ts for detection
+ *  method/threshold rationale, and supabase/migrations/0014_speech_delivery_evidence.sql. Never
+ *  contains raw audio — only timestamps/durations/position evidence. */
+export interface RealtimePauseEventRow {
+  id: string;
+  session_id: string;
+  /** External Realtime item_id of the owning user turn — not a foreign key, matching
+   *  realtime_turn_events.realtime_item_id's own convention. */
+  realtime_item_id: string;
+  start_ms: number;
+  duration_ms: number;
+  position_ratio: number;
+  position_bucket: "beginning" | "middle" | "end";
+  created_at: string;
+}
+
+export type RealtimeFillerCandidateCategory = "vocal_disfluency_candidate" | "lexical_discourse_candidate" | "repetition_candidate";
+
+/**
+ * Phase 4A: one row per filler/disfluency CANDIDATE occurrence — see
+ * src/lib/realtime/fillerCandidates.ts for what "candidate" deliberately does not mean (a proven
+ * filler) and why reliability differs by category. `classification` is always 'unclassified' today;
+ * the column exists so a future Phase 4B can update rows in place rather than needing a new table.
+ */
+export interface RealtimeDisfluencyCandidateRow {
+  id: string;
+  session_id: string;
+  realtime_item_id: string;
+  turn_index: number;
+  category: RealtimeFillerCandidateCategory;
+  classification: string;
+  phrase: string;
+  transcript_start_char: number;
+  transcript_end_char: number;
+  context_before: string;
+  context_after: string;
+  /** Estimated by proportional interpolation across the turn's span — NOT a measured timestamp. See
+   *  sessionTimeline.ts's FillerCandidateMetric doc comment. */
+  approx_session_ms: number | null;
   created_at: string;
 }
 
@@ -259,6 +313,23 @@ export interface RealtimeSessionMetricsRow {
   longest_user_response_latency_ms: number | null;
   avg_ai_response_latency_ms: number | null;
   median_ai_response_latency_ms: number | null;
+  // Phase 4A speech-delivery evidence — see sessionTimeline.ts's SessionLevelMetrics doc comments.
+  avg_words_per_minute: number | null;
+  median_words_per_minute: number | null;
+  fastest_user_turn_wpm: number | null;
+  slowest_user_turn_wpm: number | null;
+  wpm_trend_slope_per_turn: number | null;
+  vocal_disfluency_candidate_count: number;
+  lexical_discourse_candidate_count: number;
+  repetition_candidate_count: number;
+  candidate_rate_per_100_words: number | null;
+  candidate_rate_per_minute_speaking: number | null;
+  intra_pause_count: number;
+  total_intra_pause_ms: number;
+  avg_intra_pause_ms: number | null;
+  median_intra_pause_ms: number | null;
+  longest_intra_pause_ms: number | null;
+  pauses_per_minute_speaking: number | null;
   computed_at: string;
 }
 
@@ -276,6 +347,8 @@ export interface Database {
       evaluations: Table<EvaluationRow, Omit<EvaluationRow, "id" | "created_at">>;
       realtime_turn_events: Table<RealtimeTurnEventRow, Omit<RealtimeTurnEventRow, "id" | "created_at">>;
       realtime_session_metrics: Table<RealtimeSessionMetricsRow, Omit<RealtimeSessionMetricsRow, "id" | "computed_at">>;
+      realtime_pause_events: Table<RealtimePauseEventRow, Omit<RealtimePauseEventRow, "id" | "created_at">>;
+      realtime_disfluency_candidates: Table<RealtimeDisfluencyCandidateRow, Omit<RealtimeDisfluencyCandidateRow, "id" | "created_at">>;
     };
     Views: Record<string, never>;
     Functions: Record<string, never>;

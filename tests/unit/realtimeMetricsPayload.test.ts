@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  mapMetricsPayloadToFillerCandidates,
+  mapMetricsPayloadToPauseEvents,
   mapMetricsPayloadToSessionMetrics,
   mapMetricsPayloadToTurnEvents,
   metricsPayloadSchema,
@@ -25,6 +27,8 @@ function basePayload(): MetricsPayload {
     aiTurns: [],
     overlaps: [],
     confirmedBargeIns: [],
+    pauses: [],
+    fillerCandidates: [],
     session: {
       totalDurationMs: 30000,
       userTurnCount: 0,
@@ -46,7 +50,33 @@ function basePayload(): MetricsPayload {
       longestUserResponseLatencyMs: null,
       avgAiResponseLatencyMs: null,
       medianAiResponseLatencyMs: null,
+      avgWordsPerMinute: null,
+      medianWordsPerMinute: null,
+      fastestUserTurnWpm: null,
+      slowestUserTurnWpm: null,
+      wpmTrendSlopePerTurn: null,
+      vocalDisfluencyCandidateCount: 0,
+      lexicalDiscourseCandidateCount: 0,
+      repetitionCandidateCount: 0,
+      candidateRatePer100Words: null,
+      candidateRatePerMinuteSpeaking: null,
+      intraPauseCount: 0,
+      totalIntraPauseMs: 0,
+      avgIntraPauseMs: null,
+      medianIntraPauseMs: null,
+      longestIntraPauseMs: null,
+      pausesPerMinuteSpeaking: null,
     },
+  };
+}
+
+function baseUserTurnFields() {
+  return {
+    wordCount: null,
+    speakingRateWpm: null,
+    avgRelativeIntensity: null,
+    peakRelativeIntensity: null,
+    intensityVariability: null,
   };
 }
 
@@ -67,6 +97,7 @@ describe("metricsPayloadSchema", () => {
       transcript: "Sure, let's do that.",
       transcriptionFailed: false,
       audibleAiResponseIdAtStart: null,
+      ...baseUserTurnFields(),
     });
 
     const result = metricsPayloadSchema.safeParse(payload);
@@ -172,6 +203,7 @@ describe("mapMetricsPayloadToTurnEvents", () => {
       transcript: "Okay.",
       transcriptionFailed: false,
       audibleAiResponseIdAtStart: null,
+      ...baseUserTurnFields(),
     });
     payload.aiTurns.push({
       turnIndex: 1,
@@ -230,6 +262,7 @@ describe("mapMetricsPayloadToTurnEvents", () => {
       transcript: "Right.",
       transcriptionFailed: false,
       audibleAiResponseIdAtStart: null,
+      ...baseUserTurnFields(),
     });
 
     const [event] = mapMetricsPayloadToTurnEvents(payload);
@@ -262,6 +295,22 @@ describe("mapMetricsPayloadToSessionMetrics", () => {
       longestUserResponseLatencyMs: 1201.75,
       avgAiResponseLatencyMs: 458.6666,
       medianAiResponseLatencyMs: 450.25,
+      avgWordsPerMinute: 145.5,
+      medianWordsPerMinute: 140.25,
+      fastestUserTurnWpm: 180.75,
+      slowestUserTurnWpm: 110.5,
+      wpmTrendSlopePerTurn: 2.5,
+      vocalDisfluencyCandidateCount: 3,
+      lexicalDiscourseCandidateCount: 4,
+      repetitionCandidateCount: 1,
+      candidateRatePer100Words: 5.5,
+      candidateRatePerMinuteSpeaking: 1.25,
+      intraPauseCount: 6,
+      totalIntraPauseMs: 3200.5,
+      avgIntraPauseMs: 533.4166,
+      medianIntraPauseMs: 500.25,
+      longestIntraPauseMs: 900.75,
+      pausesPerMinuteSpeaking: 2.1,
     };
 
     const row = mapMetricsPayloadToSessionMetrics(payload);
@@ -277,6 +326,13 @@ describe("mapMetricsPayloadToSessionMetrics", () => {
     expect(row.total_user_speaking_ms).toBe(8123.75);
     expect(row.total_ai_speaking_ms).toBe(9042.125);
     expect(row.total_overlap_ms).toBe(512.5);
+
+    // Phase 4A speech-delivery aggregates pass through untouched too.
+    expect(row.avg_words_per_minute).toBe(145.5);
+    expect(row.wpm_trend_slope_per_turn).toBe(2.5);
+    expect(row.vocal_disfluency_candidate_count).toBe(3);
+    expect(row.intra_pause_count).toBe(6);
+    expect(row.avg_intra_pause_ms).toBe(533.4166);
 
     // Genuine counters stay whole numbers — never rounded/coerced away from integers.
     expect(Number.isInteger(row.user_turn_count)).toBe(true);
@@ -304,6 +360,7 @@ describe("mapMetricsPayloadToSessionMetrics", () => {
       transcript: "Yes, that works.",
       transcriptionFailed: false,
       audibleAiResponseIdAtStart: null,
+      ...baseUserTurnFields(),
     });
     raw.session.userTurnCount = 1;
     raw.session.avgUserTurnDurationMs = 800;
@@ -316,5 +373,68 @@ describe("mapMetricsPayloadToSessionMetrics", () => {
     expect(turnEvents).toHaveLength(1);
     expect(turnEvents[0].start_ms).toBe(16258.5);
     expect(sessionMetrics.user_turn_count).toBe(1);
+  });
+});
+
+describe("Phase 4A: pause events and filler candidates", () => {
+  it("accepts and maps a pause event to realtime_pause_events row shape", () => {
+    const payload = basePayload();
+    payload.pauses.push({ itemId: "item_1", startMs: 1200.5, durationMs: 350.25, positionRatio: 0.4, positionBucket: "middle" });
+
+    const result = metricsPayloadSchema.safeParse(payload);
+    expect(result.success).toBe(true);
+
+    const rows = mapMetricsPayloadToPauseEvents(payload);
+    expect(rows).toEqual([
+      { realtime_item_id: "item_1", start_ms: 1200.5, duration_ms: 350.25, position_ratio: 0.4, position_bucket: "middle" },
+    ]);
+  });
+
+  it("rejects a positionRatio outside [0, 1]", () => {
+    const payload = basePayload();
+    payload.pauses.push({ itemId: "item_1", startMs: 0, durationMs: 300, positionRatio: 1.5, positionBucket: "end" });
+    expect(metricsPayloadSchema.safeParse(payload).success).toBe(false);
+  });
+
+  it("accepts and maps a filler candidate, enforcing classification stays literally 'unclassified'", () => {
+    const payload = basePayload();
+    payload.fillerCandidates.push({
+      itemId: "item_1",
+      turnIndex: 1,
+      category: "lexical_discourse_candidate",
+      classification: "unclassified",
+      phrase: "well",
+      transcriptStartChar: 0,
+      transcriptEndChar: 4,
+      contextBefore: "",
+      contextAfter: " I understand",
+      approxSessionMs: 1234.5,
+    });
+
+    const result = metricsPayloadSchema.safeParse(payload);
+    expect(result.success).toBe(true);
+
+    const rows = mapMetricsPayloadToFillerCandidates(payload);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].category).toBe("lexical_discourse_candidate");
+    expect(rows[0].classification).toBe("unclassified");
+  });
+
+  it("rejects a filler candidate whose classification is anything other than 'unclassified'", () => {
+    const payload = basePayload();
+    payload.fillerCandidates.push({
+      itemId: "item_1",
+      turnIndex: 1,
+      category: "lexical_discourse_candidate",
+      // @ts-expect-error — deliberately invalid: this schema must reject a premature judgment.
+      classification: "likely_filler",
+      phrase: "well",
+      transcriptStartChar: 0,
+      transcriptEndChar: 4,
+      contextBefore: "",
+      contextAfter: "",
+      approxSessionMs: null,
+    });
+    expect(metricsPayloadSchema.safeParse(payload).success).toBe(false);
   });
 });

@@ -99,4 +99,14 @@ describe("connectRealtimeSession — microphone constraints", () => {
 
     await expect(connectRealtimeSession("secret", { onServerEvent: vi.fn(), onRemoteTrack: vi.fn() })).resolves.toBeDefined();
   });
+
+  it("exposes the local mic stream on the returned connection, for Phase 4A's speech-delivery evidence layer", async () => {
+    const track = makeFakeTrack();
+    const stream = makeFakeStream(track);
+    const getUserMedia = vi.fn(async () => stream);
+    stubBrowserGlobals(getUserMedia);
+
+    const connection = await connectRealtimeSession("secret", { onServerEvent: vi.fn(), onRemoteTrack: vi.fn() });
+    expect(connection.localStream).toBe(stream);
+  });
 });

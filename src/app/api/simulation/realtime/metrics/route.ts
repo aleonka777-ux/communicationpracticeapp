@@ -2,19 +2,32 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { requireOwnedSession, ApiError } from "@/lib/practice/authorize";
-import { saveRealtimeTurnEvents, upsertRealtimeSessionMetrics } from "@/lib/db/realtimeMetrics";
-import { mapMetricsPayloadToSessionMetrics, mapMetricsPayloadToTurnEvents, metricsPayloadSchema } from "@/lib/realtime/metricsPayload";
+import {
+  saveRealtimeDisfluencyCandidates,
+  saveRealtimePauseEvents,
+  saveRealtimeTurnEvents,
+  upsertRealtimeSessionMetrics,
+} from "@/lib/db/realtimeMetrics";
+import {
+  mapMetricsPayloadToFillerCandidates,
+  mapMetricsPayloadToPauseEvents,
+  mapMetricsPayloadToSessionMetrics,
+  mapMetricsPayloadToTurnEvents,
+  metricsPayloadSchema,
+} from "@/lib/realtime/metricsPayload";
 
 export const runtime = "nodejs";
 
 /**
  * Persists the objective timing/interruption measurement layer captured client-side by
- * src/lib/realtime/sessionTimeline.ts — never raw audio, only timestamps (ms relative to session
- * start), durations, and small structured metadata. Called best-effort by the client immediately
- * before /api/practice/end; a failure here is logged and must never block or affect that call
- * (see /docs/DECISIONS.md "Realtime timing metrics" — an optional metric write can never cost the
- * user their core transcript or evaluation). Validation schema and DB-row mapping live in
- * src/lib/realtime/metricsPayload.ts so they're directly unit-testable.
+ * src/lib/realtime/sessionTimeline.ts, plus the Phase 4A speech-delivery evidence layer
+ * (src/lib/realtime/speechDeliveryTracker.ts + fillerCandidates.ts) — never raw audio, only
+ * timestamps (ms relative to session start), durations, word/candidate counts, and relative
+ * (unitless) intensity scalars. Called best-effort by the client immediately before
+ * /api/practice/end; a failure here is logged and must never block or affect that call (see
+ * /docs/DECISIONS.md — an optional metric write can never cost the user their core transcript or
+ * evaluation). Validation schema and DB-row mapping live in src/lib/realtime/metricsPayload.ts so
+ * they're directly unit-testable.
  */
 
 export async function POST(request: Request) {
@@ -29,6 +42,8 @@ export async function POST(request: Request) {
     }
 
     await saveRealtimeTurnEvents(supabase, sessionId, mapMetricsPayloadToTurnEvents(body));
+    await saveRealtimePauseEvents(supabase, sessionId, mapMetricsPayloadToPauseEvents(body));
+    await saveRealtimeDisfluencyCandidates(supabase, sessionId, mapMetricsPayloadToFillerCandidates(body));
     await upsertRealtimeSessionMetrics(supabase, sessionId, mapMetricsPayloadToSessionMetrics(body));
 
     return NextResponse.json({ ok: true });

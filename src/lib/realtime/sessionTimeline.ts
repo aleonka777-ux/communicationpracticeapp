@@ -1,3 +1,5 @@
+import { detectFillerCandidates, type FillerCandidate } from "@/lib/realtime/fillerCandidates";
+
 /**
  * Objective conversational timing + interruption measurement layer for a Realtime practice
  * session. This is a measurement layer only — it derives numerical timing/overlap facts, never
@@ -168,6 +170,18 @@
  * server clock for that one figure specifically (see the AI/user turn boundaries note above) and is
  * never used in the overlap/latency interval math itself.
  *
+ * Phase 4A — speech-delivery EVIDENCE (speaking rate, filler/disfluency candidates): added at
+ * finalize() time, from data this module already has (a confirmed turn's final transcript and
+ * duration) — no new event sources, no live audio needed for these two specifically (intra-utterance
+ * pauses and relative vocal intensity DO need live audio-energy sampling and live entirely in
+ * src/lib/realtime/speechDeliveryTracker.ts + micEnergyMonitor.ts instead, merged into the payload by
+ * the client component at post time). This is a measurement layer only, exactly like the timing
+ * metrics above: it derives neutral, uninterpreted facts (a word count, a candidate token's
+ * position), never a judgment ("too many fillers", "good pause", "nervous"). See
+ * /docs/DECISIONS.md "Phase 4A: speech-delivery evidence" for the full audit and design rationale,
+ * including why filler-candidate reliability is NOT uniform across categories (see
+ * fillerCandidates.ts's own doc comment) and why speaking rate excludes very short turns.
+ *
  * User-speech-event classification: a raw `speech_started` -> `speech_stopped` pair is NOT by
  * itself evidence that a real user communication turn occurred — production testing has confirmed
  * false `speech_started` events from speaker echo. Every such event is classified as either
@@ -216,6 +230,17 @@ export interface UserTurnMetric {
    *  moment (though a response may still have been pending — see the module doc comment on
    *  classifying audible-vs-pre_playback at speech-start time). */
   audibleAiResponseIdAtStart: string | null;
+  /** Literal whitespace-tokenized count of the transcript ("trim, split on whitespace, drop empty
+   *  tokens") — an approximation, not linguistic word segmentation. Null when no transcript text
+   *  exists to count (never received, or transcription failed). See the module doc comment on
+   *  Phase 4A speech-delivery evidence. */
+  wordCount: number | null;
+  /** wordCount / (durationMs / 60000). Null whenever wordCount is null, OR wordCount is below
+   *  MIN_WORDS_FOR_RATE — a 1-2 word turn's "rate" is dominated by turn-boundary VAD timing noise
+   *  (the server's own silence-detection tail baked into every turn boundary), not real articulation
+   *  speed, so reporting a number there would manufacture false precision. This is evidence, not a
+   *  judgment: no "ideal" WPM is defined or implied anywhere in this module. */
+  speakingRateWpm: number | null;
 }
 
 export interface AiTurnMetric {
@@ -267,6 +292,26 @@ export interface ResponseCancelledMetric {
   reason: string;
 }
 
+/** One filler/disfluency CANDIDATE occurrence, attributed back to the confirmed user turn it came
+ *  from. See fillerCandidates.ts's own doc comment for what "candidate" deliberately does NOT mean
+ *  (a proven filler) and why reliability differs by category. */
+export interface FillerCandidateMetric extends FillerCandidate {
+  /** Named itemId (not userItemId, unlike OverlapIntervalMetric) to match metricsPayload.ts's
+   *  fillerCandidateSchema field name exactly, since this metric is posted through that schema
+   *  as-is. */
+  itemId: string;
+  /** The same turnIndex as the owning UserTurnMetric — always non-null, since candidates are only
+   *  ever derived from CONFIRMED turns' transcripts (a suspected_noise turn's transcript, if any, is
+   *  not evidence of real speech content). */
+  turnIndex: number;
+  /** Estimated by linear interpolation across the turn's own [startMs, endMs] span, proportional to
+   *  the candidate's position within the transcript string — NOT a measured timestamp, since no
+   *  word-level timing is available from the current transcription pipeline (see the module doc
+   *  comment). Null only if the turn's transcript was empty (should not occur in practice, since a
+   *  candidate implies non-empty transcript text). */
+  approxSessionMs: number | null;
+}
+
 export interface SessionLevelMetrics {
   totalDurationMs: number;
   userTurnCount: number;
@@ -296,6 +341,31 @@ export interface SessionLevelMetrics {
   /** System/product-quality metric ONLY — never a user communication-performance signal. */
   avgAiResponseLatencyMs: number | null;
   medianAiResponseLatencyMs: number | null;
+
+  // --- Phase 4A: speech-delivery evidence (see the module doc comment). All derived from
+  // CONFIRMED user turns only, same exclusion as every metric above. Neutral evidence — no "ideal"
+  // WPM, no filler scoring, no interpretation of what a candidate or a rate means.
+  /** Turns meeting MIN_WORDS_FOR_RATE only — see UserTurnMetric.speakingRateWpm. */
+  avgWordsPerMinute: number | null;
+  medianWordsPerMinute: number | null;
+  fastestUserTurnWpm: number | null;
+  slowestUserTurnWpm: number | null;
+  /** Slope of a simple linear regression of WPM against turn order (WPM per turn). Null unless at
+   *  least 3 turns meet MIN_WORDS_FOR_RATE — a trend line through fewer than 3 points is not a
+   *  meaningful trend. Sign/magnitude only, deliberately not labeled "improving"/"declining". */
+  wpmTrendSlopePerTurn: number | null;
+  /** See fillerCandidates.ts — best-effort, UNDERCOUNT-ONLY (Whisper-family transcription is known
+   *  to inconsistently drop these). Never compare this count against lexicalDiscourseCandidateCount
+   *  as if they were equally reliable. */
+  vocalDisfluencyCandidateCount: number;
+  lexicalDiscourseCandidateCount: number;
+  repetitionCandidateCount: number;
+  /** (vocal + lexical + repetition candidates) per 100 words of confirmed-turn transcript. Null if
+   *  zero words were spoken. */
+  candidateRatePer100Words: number | null;
+  /** Same numerator, per minute of total confirmed user speaking time. Null if totalUserSpeakingMs
+   *  is 0. */
+  candidateRatePerMinuteSpeaking: number | null;
 }
 
 export interface SessionTimelineSnapshot {
@@ -305,6 +375,8 @@ export interface SessionTimelineSnapshot {
   overlaps: OverlapIntervalMetric[];
   confirmedBargeIns: ConfirmedBargeInMetric[];
   responseCancellations: ResponseCancelledMetric[];
+  /** Phase 4A evidence — see the module doc comment. Derived only from CONFIRMED user turns. */
+  fillerCandidates: FillerCandidateMetric[];
   session: SessionLevelMetrics;
   /** Human-readable descriptions of any structural invariant violated by this snapshot (e.g. AI
    *  speaking time exceeding session duration, overlapping AI turns) — see
@@ -402,6 +474,34 @@ function median(values: number[]): number | null {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+/** Literal whitespace tokenization — see UserTurnMetric.wordCount's doc comment. */
+function countWords(transcript: string): number {
+  const trimmed = transcript.trim();
+  if (trimmed.length === 0) return 0;
+  return trimmed.split(/\s+/).length;
+}
+
+/** A turn shorter than this many words produces a WPM figure dominated by turn-boundary VAD timing
+ *  noise rather than real articulation rate — see UserTurnMetric.speakingRateWpm's doc comment. */
+const MIN_WORDS_FOR_RATE = 3;
+
+/** Simple ordinary-least-squares slope of y against x = 0..n-1 (turn order). Null for fewer than 3
+ *  points — see SessionLevelMetrics.wpmTrendSlopePerTurn's doc comment. */
+function linearRegressionSlope(values: number[]): number | null {
+  if (values.length < 3) return null;
+  const n = values.length;
+  const xs = values.map((_, i) => i);
+  const xMean = average(xs) as number; // non-null: xs.length === values.length >= 3
+  const yMean = average(values) as number;
+  let numerator = 0;
+  let denominator = 0;
+  for (let i = 0; i < n; i++) {
+    numerator += (xs[i] - xMean) * (values[i] - yMean);
+    denominator += (xs[i] - xMean) ** 2;
+  }
+  return denominator === 0 ? null : numerator / denominator;
 }
 
 /** See the module doc comment's classification rule 4 — the last-resort fallback when a user
@@ -685,6 +785,13 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
           triggeredConfirmedBargeIn: t.triggeredConfirmedBargeIn,
         });
         const turnIndex = classification === "confirmed" ? ++confirmedIndex : null;
+        // Word count / speaking rate: evidence only, computed here (not gated on classification)
+        // since a suspected_noise turn is filtered out of confirmedUserTurns below anyway, and
+        // computing it unconditionally keeps this mapping a straightforward function of the turn's
+        // own transcript+duration. See UserTurnMetric's doc comments for MIN_WORDS_FOR_RATE.
+        const wordCount = t.transcript !== null ? countWords(t.transcript) : null;
+        const speakingRateWpm =
+          wordCount !== null && wordCount >= MIN_WORDS_FOR_RATE && durationMs > 0 ? wordCount / (durationMs / 60000) : null;
         return {
           turnIndex,
           classification,
@@ -699,6 +806,8 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
           transcript: t.transcript,
           transcriptionFailed: t.transcriptionFailed,
           audibleAiResponseIdAtStart: t.audibleAiResponseIdAtStart,
+          wordCount,
+          speakingRateWpm,
         };
       });
       // Everything below derives session-level facts from CONFIRMED user turns only — a
@@ -706,6 +815,24 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
       // latency (in either direction), or overlap. It is still returned in `userTurns` above,
       // unabridged, for diagnostic/audit purposes.
       const confirmedUserTurns = userTurns.filter((t) => t.classification === "confirmed");
+
+      // Filler/disfluency candidates: derived purely from each CONFIRMED turn's own final
+      // transcript (fillerCandidates.ts is pure string logic — see its doc comment for reliability
+      // caveats by category). approxSessionMs interpolates proportionally across the turn's own
+      // [startMs, endMs] span, since no word-level timing exists in the transcription pipeline.
+      const fillerCandidates: FillerCandidateMetric[] = confirmedUserTurns.flatMap((t) => {
+        if (!t.transcript || t.turnIndex === null) return [];
+        const transcript = t.transcript;
+        const turnIndex = t.turnIndex;
+        const transcriptLength = transcript.length;
+        return detectFillerCandidates(transcript).map((c) => ({
+          ...c,
+          itemId: t.itemId,
+          turnIndex,
+          approxSessionMs:
+            transcriptLength > 0 ? t.startMs + (c.transcriptStartChar / transcriptLength) * t.durationMs : null,
+        }));
+      });
 
       // Resolve every confirmed barge-in's final context/attribution against the full timeline —
       // must run BEFORE aiTurns is built below, so a retroactive "audible" reclassification's
@@ -788,6 +915,19 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
       const totalAiSpeakingMs = aiTurns.reduce((sum, t) => sum + t.durationMs, 0);
       const totalOverlapMs = overlaps.reduce((sum, o) => sum + o.durationMs, 0);
 
+      // Speaking rate: only turns meeting MIN_WORDS_FOR_RATE contribute — see
+      // UserTurnMetric.speakingRateWpm's doc comment. Fastest/slowest/trend are drawn from this same
+      // filtered set, never from every confirmed turn, so a one-word "Okay." never appears as a
+      // spurious "fastest turn".
+      const qualifyingWpmTurns = confirmedUserTurns.filter((t) => t.speakingRateWpm !== null);
+      const wpmValues = qualifyingWpmTurns.map((t) => t.speakingRateWpm as number);
+
+      const totalWords = confirmedUserTurns.reduce((sum, t) => sum + (t.wordCount ?? 0), 0);
+      const vocalDisfluencyCandidateCount = fillerCandidates.filter((c) => c.category === "vocal_disfluency_candidate").length;
+      const lexicalDiscourseCandidateCount = fillerCandidates.filter((c) => c.category === "lexical_discourse_candidate").length;
+      const repetitionCandidateCount = fillerCandidates.filter((c) => c.category === "repetition_candidate").length;
+      const totalCandidates = fillerCandidates.length;
+
       const session: SessionLevelMetrics = {
         totalDurationMs: finalizedAtMs,
         userTurnCount: confirmedUserTurns.length,
@@ -809,6 +949,16 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
         longestUserResponseLatencyMs: userResponseLatencies.length > 0 ? Math.max(...userResponseLatencies) : null,
         avgAiResponseLatencyMs: average(aiResponseLatencies),
         medianAiResponseLatencyMs: median(aiResponseLatencies),
+        avgWordsPerMinute: average(wpmValues),
+        medianWordsPerMinute: median(wpmValues),
+        fastestUserTurnWpm: wpmValues.length > 0 ? Math.max(...wpmValues) : null,
+        slowestUserTurnWpm: wpmValues.length > 0 ? Math.min(...wpmValues) : null,
+        wpmTrendSlopePerTurn: linearRegressionSlope(wpmValues),
+        vocalDisfluencyCandidateCount,
+        lexicalDiscourseCandidateCount,
+        repetitionCandidateCount,
+        candidateRatePer100Words: totalWords > 0 ? (totalCandidates / totalWords) * 100 : null,
+        candidateRatePerMinuteSpeaking: totalUserSpeakingMs > 0 ? totalCandidates / (totalUserSpeakingMs / 60000) : null,
       };
 
       const invariantViolations = validateSessionTimelineInvariants({ session, aiTurns, confirmedUserTurns });
@@ -823,6 +973,7 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
         overlaps,
         confirmedBargeIns: [...confirmedBargeIns],
         responseCancellations: [...responseCancellations],
+        fillerCandidates,
         session,
         invariantViolations,
       };
@@ -837,7 +988,11 @@ export function formatSessionTimelineDebugLines(snapshot: SessionTimelineSnapsho
 
   for (const t of snapshot.userTurns) {
     if (t.classification === "confirmed") {
-      lines.push(`User turn ${t.turnIndex}: start ${toS(t.startMs)}s / end ${toS(t.endMs)}s / duration ${toS(t.durationMs)}s`);
+      const wpmSuffix =
+        t.wordCount !== null
+          ? ` / ${t.wordCount} word(s)${t.speakingRateWpm !== null ? ` / ${t.speakingRateWpm.toFixed(0)} WPM` : " (too short for a rate)"}`
+          : "";
+      lines.push(`User turn ${t.turnIndex}: start ${toS(t.startMs)}s / end ${toS(t.endMs)}s / duration ${toS(t.durationMs)}s${wpmSuffix}`);
     } else {
       lines.push(
         `Suspected false VAD/noise event (excluded): start ${toS(t.startMs)}s / end ${toS(t.endMs)}s / duration ${toS(t.durationMs)}s / transcript ${t.transcript === null ? "none received" : t.transcript === "" ? "empty" : `"${t.transcript}"`}${t.transcriptionFailed ? " / transcription failed" : ""}`,
@@ -861,6 +1016,19 @@ export function formatSessionTimelineDebugLines(snapshot: SessionTimelineSnapsho
   lines.push(`Technical confirmed barge-in (all, incl. pre-playback): ${snapshot.session.technicalBargeInCount}`);
   lines.push(`Overlap: ${snapshot.overlaps.length} interval(s), ${toS(snapshot.session.totalOverlapMs)}s total`);
   lines.push(`Suspected false VAD/noise events excluded: ${snapshot.session.suspectedNoiseEventCount}`);
+  if (snapshot.session.avgWordsPerMinute !== null) {
+    lines.push(
+      `Speaking rate (evidence only, no ideal implied): avg ${snapshot.session.avgWordsPerMinute.toFixed(0)} WPM / median ${(snapshot.session.medianWordsPerMinute ?? 0).toFixed(0)} WPM / fastest ${(snapshot.session.fastestUserTurnWpm ?? 0).toFixed(0)} / slowest ${(snapshot.session.slowestUserTurnWpm ?? 0).toFixed(0)}`,
+    );
+  }
+  if (snapshot.fillerCandidates.length > 0) {
+    lines.push(
+      `Filler/disfluency candidates (unclassified — see fillerCandidates.ts for reliability caveats): ${snapshot.session.vocalDisfluencyCandidateCount} vocal (undercount-only), ${snapshot.session.lexicalDiscourseCandidateCount} lexical/discourse, ${snapshot.session.repetitionCandidateCount} repetition`,
+    );
+    for (const c of snapshot.fillerCandidates) {
+      lines.push(`  - "${c.phrase}" [${c.category}, ${c.classification}] in user turn ${c.turnIndex} (…${c.contextBefore}[${c.phrase}]${c.contextAfter}…)`);
+    }
+  }
   if (snapshot.invariantViolations.length > 0) {
     lines.push(`INVARIANT VIOLATIONS (${snapshot.invariantViolations.length}):`);
     for (const violation of snapshot.invariantViolations) lines.push(`  - ${violation}`);

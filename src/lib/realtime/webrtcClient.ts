@@ -33,6 +33,11 @@ export interface RealtimeConnectionHandlers {
 export interface RealtimeConnection {
   sendEvent: (event: Record<string, unknown>) => void;
   close: () => void;
+  /** The local microphone MediaStream — exposed so Phase 4A's speech-delivery evidence layer
+   *  (src/lib/realtime/micEnergyMonitor.ts) can attach a live energy analyser to it. This is the
+   *  SAME stream already sent to the peer connection above; nothing new is captured or recorded by
+   *  exposing it, and no audio data is ever copied out of the browser's own audio graph. */
+  localStream: MediaStream;
 }
 
 function waitForIceGatheringComplete(pc: RTCPeerConnection): Promise<void> {
@@ -139,5 +144,6 @@ export async function connectRealtimeSession(
       if (dataChannel.readyState === "open") dataChannel.send(JSON.stringify(event));
     },
     close,
+    localStream,
   };
 }

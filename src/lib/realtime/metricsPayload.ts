@@ -1,5 +1,10 @@
 import { z } from "zod";
-import type { RealtimeSessionMetricsInput, RealtimeTurnEventInput } from "@/lib/db/realtimeMetrics";
+import type {
+  RealtimeDisfluencyCandidateInput,
+  RealtimePauseEventInput,
+  RealtimeSessionMetricsInput,
+  RealtimeTurnEventInput,
+} from "@/lib/db/realtimeMetrics";
 
 /**
  * Validation + DB-row mapping for the objective timing/interruption measurement layer POSTed to
@@ -17,6 +22,8 @@ const durationSourceSchema = z.enum(["server_vad", "client_playback"]);
 const responseStatusSchema = z.enum(["completed", "cancelled", "failed", "incomplete", "in_progress"]);
 const userSpeechClassificationSchema = z.enum(["confirmed", "suspected_noise"]);
 const bargeInContextSchema = z.enum(["audible", "pre_playback"]);
+const fillerCandidateCategorySchema = z.enum(["vocal_disfluency_candidate", "lexical_discourse_candidate", "repetition_candidate"]);
+const pausePositionBucketSchema = z.enum(["beginning", "middle", "end"]);
 
 const userTurnSchema = z.object({
   // null for a suspected_noise event — it isn't part of the numbered conversation. See
@@ -37,6 +44,38 @@ const userTurnSchema = z.object({
   // src/lib/realtime/sessionTimeline.ts's doc comment on classifying audible-vs-pre_playback at
   // speech-start time.
   audibleAiResponseIdAtStart: z.string().nullable(),
+  // Phase 4A speech-delivery evidence — see sessionTimeline.ts's UserTurnMetric doc comments.
+  wordCount: z.number().int().nonnegative().nullable(),
+  speakingRateWpm: z.number().nullable(),
+  // Populated client-side from src/lib/realtime/speechDeliveryTracker.ts's per-turn aggregate,
+  // merged in by realtime-simulation-client.tsx by itemId — null for a turn the tracker never saw
+  // a sample for (e.g. mic energy monitor failed to start; never blocks the rest of the payload).
+  avgRelativeIntensity: z.number().nullable(),
+  peakRelativeIntensity: z.number().nullable(),
+  intensityVariability: z.number().nullable(),
+});
+
+const pauseEventSchema = z.object({
+  itemId: z.string().min(1),
+  startMs: z.number(),
+  durationMs: z.number(),
+  positionRatio: z.number().min(0).max(1),
+  positionBucket: pausePositionBucketSchema,
+});
+
+const fillerCandidateSchema = z.object({
+  itemId: z.string().min(1),
+  turnIndex: z.number().int().positive(),
+  category: fillerCandidateCategorySchema,
+  // Always "unclassified" today — see fillerCandidates.ts's doc comment. A literal, not the general
+  // enum, so this schema itself enforces "candidates, not judgments" for Phase 4A.
+  classification: z.literal("unclassified"),
+  phrase: z.string().min(1),
+  transcriptStartChar: z.number().int().nonnegative(),
+  transcriptEndChar: z.number().int().nonnegative(),
+  contextBefore: z.string(),
+  contextAfter: z.string(),
+  approxSessionMs: z.number().nullable(),
 });
 
 const aiTurnSchema = z.object({
@@ -94,6 +133,25 @@ const sessionMetricsSchema = z.object({
   longestUserResponseLatencyMs: z.number().nullable(),
   avgAiResponseLatencyMs: z.number().nullable(),
   medianAiResponseLatencyMs: z.number().nullable(),
+  // Phase 4A speech-delivery evidence — see sessionTimeline.ts's SessionLevelMetrics doc comments.
+  avgWordsPerMinute: z.number().nullable(),
+  medianWordsPerMinute: z.number().nullable(),
+  fastestUserTurnWpm: z.number().nullable(),
+  slowestUserTurnWpm: z.number().nullable(),
+  wpmTrendSlopePerTurn: z.number().nullable(),
+  vocalDisfluencyCandidateCount: z.number().int().nonnegative(),
+  lexicalDiscourseCandidateCount: z.number().int().nonnegative(),
+  repetitionCandidateCount: z.number().int().nonnegative(),
+  candidateRatePer100Words: z.number().nullable(),
+  candidateRatePerMinuteSpeaking: z.number().nullable(),
+  // Populated client-side from speechDeliveryTracker.ts's finalize() — see the pause/intensity
+  // session aggregate doc comments there for threshold/calibration rationale.
+  intraPauseCount: z.number().int().nonnegative(),
+  totalIntraPauseMs: z.number(),
+  avgIntraPauseMs: z.number().nullable(),
+  medianIntraPauseMs: z.number().nullable(),
+  longestIntraPauseMs: z.number().nullable(),
+  pausesPerMinuteSpeaking: z.number().nullable(),
 });
 
 export const metricsPayloadSchema = z.object({
@@ -102,6 +160,8 @@ export const metricsPayloadSchema = z.object({
   aiTurns: z.array(aiTurnSchema),
   overlaps: z.array(overlapSchema),
   confirmedBargeIns: z.array(confirmedBargeInSchema),
+  pauses: z.array(pauseEventSchema),
+  fillerCandidates: z.array(fillerCandidateSchema),
   session: sessionMetricsSchema,
 });
 
@@ -135,6 +195,11 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         barge_in_context: null,
         counts_toward_interruption: null,
         audible_ai_response_id_at_start: t.audibleAiResponseIdAtStart,
+        word_count: t.wordCount,
+        speaking_rate_wpm: t.speakingRateWpm,
+        avg_relative_intensity: t.avgRelativeIntensity,
+        peak_relative_intensity: t.peakRelativeIntensity,
+        intensity_variability: t.intensityVariability,
         metadata: {},
       }),
     ),
@@ -159,6 +224,11 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         barge_in_context: null,
         counts_toward_interruption: null,
         audible_ai_response_id_at_start: null,
+        word_count: null,
+        speaking_rate_wpm: null,
+        avg_relative_intensity: null,
+        peak_relative_intensity: null,
+        intensity_variability: null,
         metadata: {},
       }),
     ),
@@ -183,6 +253,11 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         barge_in_context: null,
         counts_toward_interruption: null,
         audible_ai_response_id_at_start: null,
+        word_count: null,
+        speaking_rate_wpm: null,
+        avg_relative_intensity: null,
+        peak_relative_intensity: null,
+        intensity_variability: null,
         metadata: {},
       }),
     ),
@@ -207,10 +282,42 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         barge_in_context: b.context,
         counts_toward_interruption: b.countsTowardInterruption,
         audible_ai_response_id_at_start: null,
+        word_count: null,
+        speaking_rate_wpm: null,
+        avg_relative_intensity: null,
+        peak_relative_intensity: null,
+        intensity_variability: null,
         metadata: {},
       }),
     ),
   ];
+}
+
+/** Maps a validated payload's intra-utterance pause evidence to realtime_pause_events rows. */
+export function mapMetricsPayloadToPauseEvents(body: MetricsPayload): RealtimePauseEventInput[] {
+  return body.pauses.map((p) => ({
+    realtime_item_id: p.itemId,
+    start_ms: p.startMs,
+    duration_ms: p.durationMs,
+    position_ratio: p.positionRatio,
+    position_bucket: p.positionBucket,
+  }));
+}
+
+/** Maps a validated payload's filler/disfluency candidates to realtime_disfluency_candidates rows. */
+export function mapMetricsPayloadToFillerCandidates(body: MetricsPayload): RealtimeDisfluencyCandidateInput[] {
+  return body.fillerCandidates.map((c) => ({
+    realtime_item_id: c.itemId,
+    turn_index: c.turnIndex,
+    category: c.category,
+    classification: c.classification,
+    phrase: c.phrase,
+    transcript_start_char: c.transcriptStartChar,
+    transcript_end_char: c.transcriptEndChar,
+    context_before: c.contextBefore,
+    context_after: c.contextAfter,
+    approx_session_ms: c.approxSessionMs,
+  }));
 }
 
 /** Maps a validated payload's session-level aggregates to the realtime_session_metrics row shape. */
@@ -236,5 +343,21 @@ export function mapMetricsPayloadToSessionMetrics(body: MetricsPayload): Realtim
     longest_user_response_latency_ms: body.session.longestUserResponseLatencyMs,
     avg_ai_response_latency_ms: body.session.avgAiResponseLatencyMs,
     median_ai_response_latency_ms: body.session.medianAiResponseLatencyMs,
+    avg_words_per_minute: body.session.avgWordsPerMinute,
+    median_words_per_minute: body.session.medianWordsPerMinute,
+    fastest_user_turn_wpm: body.session.fastestUserTurnWpm,
+    slowest_user_turn_wpm: body.session.slowestUserTurnWpm,
+    wpm_trend_slope_per_turn: body.session.wpmTrendSlopePerTurn,
+    vocal_disfluency_candidate_count: body.session.vocalDisfluencyCandidateCount,
+    lexical_discourse_candidate_count: body.session.lexicalDiscourseCandidateCount,
+    repetition_candidate_count: body.session.repetitionCandidateCount,
+    candidate_rate_per_100_words: body.session.candidateRatePer100Words,
+    candidate_rate_per_minute_speaking: body.session.candidateRatePerMinuteSpeaking,
+    intra_pause_count: body.session.intraPauseCount,
+    total_intra_pause_ms: body.session.totalIntraPauseMs,
+    avg_intra_pause_ms: body.session.avgIntraPauseMs,
+    median_intra_pause_ms: body.session.medianIntraPauseMs,
+    longest_intra_pause_ms: body.session.longestIntraPauseMs,
+    pauses_per_minute_speaking: body.session.pausesPerMinuteSpeaking,
   };
 }
