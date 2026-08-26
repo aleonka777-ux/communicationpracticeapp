@@ -182,7 +182,15 @@ export function RealtimeSimulationClient({
           const snapshot = metricsRef.current?.finalize() ?? null;
           const deliverySnapshot = speechDeliveryRef.current?.finalize() ?? { pauses: [], turnIntensity: [] };
           if (snapshot) {
-            const { userTurns, pauses, sessionPauseAggregates } = mergeSpeechDeliveryEvidence(snapshot, deliverySnapshot);
+            const { userTurns, pauses, sessionPauseAggregates, invariantViolations } = mergeSpeechDeliveryEvidence(
+              snapshot,
+              deliverySnapshot,
+            );
+            if (invariantViolations.length > 0) {
+              // Never used to clamp/reject data — see mergeSpeechDeliveryEvidence.ts's doc comment.
+              // A violation here means a clock-origin/lifecycle bug, not a legitimate edge case.
+              console.error("[voice:realtime:speech-delivery] pause clock-origin invariant violation(s) — see /docs/DECISIONS.md", invariantViolations);
+            }
 
             for (const line of formatSessionTimelineDebugLines(snapshot)) {
               console.debug("[voice:realtime:metrics]", line);

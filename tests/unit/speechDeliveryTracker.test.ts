@@ -224,3 +224,73 @@ describe("createSpeechDeliveryTracker — no raw audio persisted", () => {
     }
   });
 });
+
+describe("createSpeechDeliveryTracker — clock-origin regression (production bug)", () => {
+  /**
+   * Reproduces the exact production bug: a session whose underlying performance.now() origin is
+   * already ~48.8 seconds old by the time the practice screen mounts and this tracker is
+   * constructed (the user browsed the app — home, scenario selection, setup — before starting
+   * practice). Before the fix, this tracker used the injected clock's RAW value directly as every
+   * timestamp, so a pause's persisted `startMs` was "ms since page load" (e.g. ~77270.3 for a pause
+   * ~28.4s into the session), not "ms since practice began" — wildly outside the owning turn's
+   * session-relative span, and even outside the session's own total_duration_ms. The fix anchors a
+   * session-relative zero point at construction time, exactly like sessionTimeline.ts already does.
+   */
+  it("produces session-relative pause timestamps even when the underlying clock's raw origin is ~48.8s old at construction", () => {
+    const PRODUCTION_OFFSET_MS = 48831.3;
+    const clock = createClock(PRODUCTION_OFFSET_MS); // the page has already been "running" this long
+    const tracker = createSpeechDeliveryTracker({ now: clock.now }); // constructed at raw time 48831.3
+
+    calibrate(tracker, clock);
+    tracker.openTurn("item_1");
+    speechBurst(tracker, clock, 10);
+    silenceBurst(tracker, clock, 8); // ~400ms meaningful pause
+    speechBurst(tracker, clock, 10);
+    tracker.closeTurn("item_1");
+
+    const { pauses } = tracker.finalize();
+    expect(pauses).toHaveLength(1);
+    // Session-relative: small, NOT offset by the ~48831.3ms raw clock origin (the production bug's
+    // exact symptom — a pause reported at e.g. 77270.3 instead of ~28439.0).
+    expect(pauses[0].startMs).toBeLessThan(5000);
+    expect(pauses[0].startMs).toBeGreaterThanOrEqual(0);
+    expect(pauses[0].durationMs).toBeGreaterThanOrEqual(250);
+  });
+
+  it("zeroes at its OWN construction time, not a shared/global raw clock — a tracker built 1000ms later on the same clock reports the same wall-clock pause 1000ms smaller", () => {
+    const clock = createClock(48831.3);
+    const trackerA = createSpeechDeliveryTracker({ now: clock.now });
+    clock.advance(1000); // simulate a small amount of real time passing before trackerB exists
+    const trackerB = createSpeechDeliveryTracker({ now: clock.now });
+
+    // From here on, both trackers observe the exact SAME wall-clock tick stream (fed to both at
+    // every step) — the only difference between them is their construction-time anchor, 1000ms
+    // apart on the shared underlying clock.
+    for (const tracker of [trackerA, trackerB]) tracker.openTurn("item_1");
+    for (let i = 0; i < 10; i++) {
+      trackerA.pushEnergySample(SPEECH);
+      trackerB.pushEnergySample(SPEECH);
+      clock.advance(50);
+    }
+    for (let i = 0; i < 8; i++) {
+      trackerA.pushEnergySample(SILENCE);
+      trackerB.pushEnergySample(SILENCE);
+      clock.advance(50);
+    } // ~400ms pause, observed identically by both
+    for (let i = 0; i < 10; i++) {
+      trackerA.pushEnergySample(SPEECH);
+      trackerB.pushEnergySample(SPEECH);
+      clock.advance(50);
+    }
+    for (const tracker of [trackerA, trackerB]) tracker.closeTurn("item_1");
+
+    const pauseA = trackerA.finalize().pauses[0];
+    const pauseB = trackerB.finalize().pauses[0];
+    expect(pauseA).toBeDefined();
+    expect(pauseB).toBeDefined();
+    // The SAME wall-clock pause, reported 1000ms apart — proof each tracker is anchored to its own
+    // construction moment, not the shared raw clock's absolute origin (which would report identical
+    // values for both, since it's the same underlying tick stream).
+    expect(pauseA.startMs - pauseB.startMs).toBeCloseTo(1000, 5);
+  });
+});

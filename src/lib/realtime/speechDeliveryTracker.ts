@@ -33,6 +33,22 @@
  * (default 500ms) of silence before emitting speech_stopped, so trailing silence right at a turn's
  * end is that detection tail, not a pause the user resumed speaking after — counting it would double
  * up with a phenomenon the turn-boundary timing (sessionTimeline.ts) already reflects.
+ *
+ * Clock origin — fixed production bug (see /docs/DECISIONS.md "Phase 4A pause timestamp clock-origin
+ * fix"): `pause.startMs` MUST be session-relative, on the same origin as sessionTimeline.ts's
+ * `UserTurnMetric.startMs`/`endMs` and `SessionLevelMetrics.totalDurationMs`. This tracker
+ * establishes that origin itself, exactly mirroring sessionTimeline.ts's own `sessionStartMs`/
+ * `elapsed()` idiom: the injected/default clock (`options.now`, raw `performance.now()` by default)
+ * is read ONCE at construction time and every subsequent timestamp this module produces is that raw
+ * clock's value minus that captured start — i.e. "time since this tracker was created," not "time
+ * since the page navigated." Previously this module used the injected clock's raw value DIRECTLY as
+ * every timestamp, with no such subtraction — self-consistent internally (every duration/ratio is a
+ * difference of two raw values, so those were already correct) but not zeroed at session start, so a
+ * persisted `start_ms` was actually "ms since page load," not "ms since practice began." Because both
+ * this tracker and sessionTimeline are constructed back-to-back, synchronously, in the same mount
+ * effect (realtime-simulation-client.tsx), the residual skew between their two independently-captured
+ * origins is sub-millisecond — negligible next to this module's own documented ~50ms sampling
+ * resolution, and validated by mergeSpeechDeliveryEvidence.ts's cross-tracker tolerance checks.
  */
 
 export type PausePositionBucket = "beginning" | "middle" | "end";
@@ -63,8 +79,11 @@ export interface SpeechDeliverySnapshot {
 }
 
 export interface SpeechDeliveryTrackerOptions {
-  /** Monotonic clock — defaults to performance.now(). Injectable for deterministic tests, matching
-   *  sessionTimeline.ts's own SessionTimelineOptions.now pattern. */
+  /** RAW monotonic clock — defaults to performance.now(). Injectable for deterministic tests,
+   *  matching sessionTimeline.ts's own SessionTimelineOptions.now pattern. This is read once at
+   *  construction to establish this tracker's own session-relative zero point (see the module doc
+   *  comment's "Clock origin" section) — every timestamp this module actually produces is relative
+   *  to that captured start, never this raw value directly. */
   now?: () => number;
 }
 
@@ -117,7 +136,12 @@ interface OpenTurnState {
 }
 
 export function createSpeechDeliveryTracker(options: SpeechDeliveryTrackerOptions = {}): SpeechDeliveryTracker {
-  const now = options.now ?? (() => performance.now());
+  const rawNow = options.now ?? (() => performance.now());
+  // Establish this tracker's own session-relative zero point, exactly mirroring
+  // sessionTimeline.ts's `sessionStartMs`/`elapsed()` idiom — see the module doc comment's "Clock
+  // origin" section. Every timestamp below is relative to THIS instant, never the raw clock value.
+  const sessionStartMs = rawNow();
+  const now = () => rawNow() - sessionStartMs;
 
   let noiseFloor = INITIAL_NOISE_FLOOR;
   const openTurns = new Map<string, OpenTurnState>();
