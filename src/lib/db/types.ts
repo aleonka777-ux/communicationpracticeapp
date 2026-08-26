@@ -313,6 +313,11 @@ export interface RealtimeSessionMetricsRow {
   longest_user_response_latency_ms: number | null;
   avg_ai_response_latency_ms: number | null;
   median_ai_response_latency_ms: number | null;
+  /** System/product-quality diagnostic ONLY — see sessionTimeline.ts's UnansweredUserTurnMetric doc
+   *  comment. Never a coaching signal: a confirmed user turn with no AI turn immediately following
+   *  it, beyond MIN_UNANSWERED_GAP_MS, before either the next user turn or session end. */
+  unanswered_user_turn_count: number;
+  longest_unanswered_stall_ms: number | null;
   // Phase 4A speech-delivery evidence — see sessionTimeline.ts's SessionLevelMetrics doc comments.
   avg_words_per_minute: number | null;
   median_words_per_minute: number | null;

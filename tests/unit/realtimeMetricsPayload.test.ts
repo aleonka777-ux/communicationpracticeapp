@@ -50,6 +50,8 @@ function basePayload(): MetricsPayload {
       longestUserResponseLatencyMs: null,
       avgAiResponseLatencyMs: null,
       medianAiResponseLatencyMs: null,
+      unansweredUserTurnCount: 0,
+      longestUnansweredStallMs: null,
       avgWordsPerMinute: null,
       medianWordsPerMinute: null,
       fastestUserTurnWpm: null,
@@ -295,6 +297,8 @@ describe("mapMetricsPayloadToSessionMetrics", () => {
       longestUserResponseLatencyMs: 1201.75,
       avgAiResponseLatencyMs: 458.6666,
       medianAiResponseLatencyMs: 450.25,
+      unansweredUserTurnCount: 1,
+      longestUnansweredStallMs: 45152.4,
       avgWordsPerMinute: 145.5,
       medianWordsPerMinute: 140.25,
       fastestUserTurnWpm: 180.75,
@@ -319,6 +323,8 @@ describe("mapMetricsPayloadToSessionMetrics", () => {
     expect(row.avg_user_response_latency_ms).toBe(712.333333);
     expect(row.median_user_response_latency_ms).toBe(700.5);
     expect(row.avg_ai_response_latency_ms).toBe(458.6666);
+    expect(row.unanswered_user_turn_count).toBe(1);
+    expect(row.longest_unanswered_stall_ms).toBe(45152.4);
     expect(row.median_ai_response_latency_ms).toBe(450.25);
     expect(row.avg_user_turn_duration_ms).toBe(950.125);
     expect(row.longest_user_turn_ms).toBe(1800.875);

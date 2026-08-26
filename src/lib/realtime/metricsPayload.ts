@@ -133,6 +133,10 @@ const sessionMetricsSchema = z.object({
   longestUserResponseLatencyMs: z.number().nullable(),
   avgAiResponseLatencyMs: z.number().nullable(),
   medianAiResponseLatencyMs: z.number().nullable(),
+  // System/product-quality diagnostic ONLY — see sessionTimeline.ts's UnansweredUserTurnMetric doc
+  // comment. Never a coaching signal.
+  unansweredUserTurnCount: z.number().int().nonnegative(),
+  longestUnansweredStallMs: z.number().nullable(),
   // Phase 4A speech-delivery evidence — see sessionTimeline.ts's SessionLevelMetrics doc comments.
   avgWordsPerMinute: z.number().nullable(),
   medianWordsPerMinute: z.number().nullable(),
@@ -343,6 +347,8 @@ export function mapMetricsPayloadToSessionMetrics(body: MetricsPayload): Realtim
     longest_user_response_latency_ms: body.session.longestUserResponseLatencyMs,
     avg_ai_response_latency_ms: body.session.avgAiResponseLatencyMs,
     median_ai_response_latency_ms: body.session.medianAiResponseLatencyMs,
+    unanswered_user_turn_count: body.session.unansweredUserTurnCount,
+    longest_unanswered_stall_ms: body.session.longestUnansweredStallMs,
     avg_words_per_minute: body.session.avgWordsPerMinute,
     median_words_per_minute: body.session.medianWordsPerMinute,
     fastest_user_turn_wpm: body.session.fastestUserTurnWpm,

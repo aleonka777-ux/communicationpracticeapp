@@ -203,6 +203,51 @@ import { detectFillerCandidates, type FillerCandidate } from "@/lib/realtime/fil
  *      waits ~500ms of silence before emitting `speech_stopped`, so genuine turns are rarely this
  *      short — but this path errs toward keeping anything but the briefest events rather than
  *      inventing certainty duration alone can't provide.
+ *
+ * Response-latency pairing: conversational adjacency, not nearest-preceding-turn — fixed a
+ * production incident where a genuine ~45-SECOND system non-response (the AI never replied after a
+ * user turn; the UI was stuck "Thinking" until the user eventually spoke again) was recorded as
+ * `longest_user_response_latency_ms = 45152.4`, i.e. blamed on the user. Root cause: the previous
+ * algorithm computed, independently for each confirmed user turn, "the most recent AI turn that
+ * ends at or before this turn's start" — with NO bound on how far back that search could reach.
+ * Concretely: an AI turn (`ai_turn 5`) ended ~0.4ms AFTER the very next user turn (`user_turn 8`)
+ * began — a genuine, if vanishingly small, overlap — so the overlap-exclusion check correctly
+ * refused to pair them. But the old algorithm didn't stop there: it moved on to the NEXT user turn
+ * in the list (`user_turn 9`, spoken ~45 seconds later, once the user gave up waiting) and happily
+ * paired THAT one with the same stale `ai_turn 5`, since nothing prevented scanning arbitrarily far
+ * forward for a later turn that happened to satisfy the "no overlap" check. `user_turn 8` itself —
+ * the turn that actually should have been evaluated — was silently skipped, receiving no latency
+ * value of its own for this relationship, while `user_turn 9` inherited a physically meaningless
+ * 45-second "response time" that was really a full system outage.
+ *
+ * The fix: both `avgUserResponseLatencyMs` and `avgAiResponseLatencyMs` (and their median/longest
+ * companions) are now computed from a single merged, chronologically-ordered timeline containing
+ * every AI turn and every CONFIRMED user turn, walking only STRICTLY ADJACENT pairs — never
+ * searching further back or skipping forward. An AI-turn-then-user-turn (or user-then-AI) pair that
+ * is immediately adjacent in this merged order AND does not overlap produces exactly one latency
+ * value; an adjacent-but-overlapping pair (the `ai_turn 5`/`user_turn 8` case) produces NO value —
+ * it is left missing, never reassigned elsewhere, per the explicit product requirement that an
+ * ambiguous/overlapping/system-failed adjacency must never manufacture a number. This also makes it
+ * structurally impossible for a later, unrelated user turn to ever inherit an older AI turn's
+ * latency: `user_turn 9`'s immediate predecessor in the merged timeline is `user_turn 8` (a user
+ * turn, not an AI turn), so no AI-to-user adjacency exists for that pair at all — `user_turn 9`
+ * correctly contributes nothing to `userResponseLatencies`, and the ~45-second gap is instead
+ * captured as new, explicitly non-coaching evidence — see `UnansweredUserTurnMetric` and
+ * `MIN_UNANSWERED_GAP_MS` — a confirmed user turn whose immediate successor in the merged timeline
+ * is a LATER user turn (no AI turn at all occurred between them) or nothing (session ended), beyond
+ * a documented minimum gap that excludes ordinary VAD-segmented continuations of one utterance.
+ *
+ * The 22ms `ai_turn 5` itself, and why the UI stayed stuck in "Thinking": audited separately (see
+ * /docs/DECISIONS.md "Response-stall incident" for the full writeup) — `sessionTimeline.ts`'s own
+ * bookkeeping around this boundary is internally consistent (both `pendingResponseId` and
+ * `currentAiResponseId` are correctly cleared once that AI turn closes, via the same idempotent
+ * `closeAiTurn()` every other turn uses), so this module's data does not itself get "stuck." The
+ * indefinite "Thinking" stall is a UI state-machine gap (src/lib/realtime/connectionState.ts never
+ * leaves `thinking` on a `response.done` failure/cancellation or a generic `error` event — only a
+ * genuine `AI_STARTED_SPEAKING` or the user speaking again ever clears it), not a timing-metrics
+ * bug — this module's job here is limited to making sure the resulting silence is measured
+ * correctly (as "unanswered," never as a fabricated user latency), not to fixing the UI recovery
+ * gap itself (see realtime-simulation-client.tsx's watchdog).
  */
 
 export type TurnDurationSource = "server_vad" | "client_playback";
@@ -292,6 +337,25 @@ export interface ResponseCancelledMetric {
   reason: string;
 }
 
+/**
+ * System/product-quality diagnostic evidence ONLY — see the module doc comment's "Response-latency
+ * pairing" section. A confirmed user turn that was never immediately followed by an AI turn at all
+ * (the AI failed to respond, or a response was created but never produced audio, before either
+ * another user turn began or the session ended). Deliberately NOT a coaching-relevant metric: never
+ * implies the USER did anything wrong — this is exclusively evidence of a system/infrastructure
+ * non-response.
+ */
+export interface UnansweredUserTurnMetric {
+  userItemId: string;
+  turnIndex: number;
+  /** When the unanswered turn itself ended. */
+  endMs: number;
+  /** What ended the "waiting for a response" window. */
+  resolvedBy: "next_user_turn" | "session_end";
+  /** ms from this turn's end to whatever resolved the wait. */
+  stalledDurationMs: number;
+}
+
 /** One filler/disfluency CANDIDATE occurrence, attributed back to the confirmed user turn it came
  *  from. See fillerCandidates.ts's own doc comment for what "candidate" deliberately does NOT mean
  *  (a proven filler) and why reliability differs by category. */
@@ -334,13 +398,26 @@ export interface SessionLevelMetrics {
   avgUserTurnDurationMs: number | null;
   longestUserTurnMs: number | null;
   avgAiTurnDurationMs: number | null;
-  /** Coaching-relevant: how quickly the user responded once the AI genuinely finished speaking. */
+  /** Coaching-relevant: how quickly the user responded once the AI genuinely finished speaking.
+   *  Only computed for STRICTLY ADJACENT AI-then-user pairs in the merged conversation timeline —
+   *  see the module doc comment's "Response-latency pairing" section. A user turn with no
+   *  immediately-preceding AI turn (or an overlapping one) contributes NO value here — it is never
+   *  paired with an older, non-adjacent AI turn found by scanning further back. This means a system
+   *  response failure can never inflate this figure; see unansweredUserTurnCount/
+   *  longestUnansweredStallMs for that evidence instead. */
   avgUserResponseLatencyMs: number | null;
   medianUserResponseLatencyMs: number | null;
   longestUserResponseLatencyMs: number | null;
-  /** System/product-quality metric ONLY — never a user communication-performance signal. */
+  /** System/product-quality metric ONLY — never a user communication-performance signal. Same
+   *  strict-adjacency pairing as avgUserResponseLatencyMs, symmetrically. */
   avgAiResponseLatencyMs: number | null;
   medianAiResponseLatencyMs: number | null;
+  /** System/product-quality diagnostic ONLY — see UnansweredUserTurnMetric's doc comment. Count of
+   *  confirmed user turns with no AI turn immediately following before either the next user turn or
+   *  session end (beyond MIN_UNANSWERED_GAP_MS, so ordinary VAD-segmented continuations are never
+   *  counted). NEVER a coaching signal — this is exclusively evidence of a system non-response. */
+  unansweredUserTurnCount: number;
+  longestUnansweredStallMs: number | null;
 
   // --- Phase 4A: speech-delivery evidence (see the module doc comment). All derived from
   // CONFIRMED user turns only, same exclusion as every metric above. Neutral evidence — no "ideal"
@@ -377,6 +454,8 @@ export interface SessionTimelineSnapshot {
   responseCancellations: ResponseCancelledMetric[];
   /** Phase 4A evidence — see the module doc comment. Derived only from CONFIRMED user turns. */
   fillerCandidates: FillerCandidateMetric[];
+  /** System/product-quality diagnostic evidence — see UnansweredUserTurnMetric's doc comment. */
+  unansweredUserTurns: UnansweredUserTurnMetric[];
   session: SessionLevelMetrics;
   /** Human-readable descriptions of any structural invariant violated by this snapshot (e.g. AI
    *  speaking time exceeding session duration, overlapping AI turns) — see
@@ -463,6 +542,18 @@ export interface SessionTimeline {
    *  a fresh (very short) snapshot rather than throwing, so a duplicate finalize can't corrupt data. */
   finalize(): SessionTimelineSnapshot;
 }
+
+/**
+ * Minimum gap (with no AI turn in between) between the end of one confirmed user turn and whatever
+ * comes next before it counts as a genuine unanswered/stalled turn rather than an ordinary
+ * VAD-segmented continuation of one utterance. Server VAD splits a single utterance across a brief
+ * mid-thought pause into two consecutive user turns with no AI turn between them — production
+ * evidence (see /docs/DECISIONS.md) has shown such splits on the order of 150-200ms. A genuine
+ * system non-response, by contrast, leaves a gap of many seconds to tens of seconds. 2000ms is
+ * comfortably (10x+) above any observed legitimate segmentation gap and far below any real stall,
+ * so it distinguishes the two without needing a fragile hair-splitting threshold.
+ */
+const MIN_UNANSWERED_GAP_MS = 2000;
 
 function average(values: number[]): number | null {
   if (values.length === 0) return null;
@@ -888,27 +979,60 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
         }
       }
 
-      // Response latency: for each CONFIRMED user turn, the immediately preceding AI turn that
-      // finished strictly before this one started (no overlap — an overlapping pair is a
-      // barge-in/overlap, not ordinary latency, per the product requirement).
-      const userResponseLatencies: number[] = [];
-      for (const u of confirmedUserTurns) {
-        const precedingAi = aiTurns
-          .filter((a) => a.endMs <= u.startMs)
-          .reduce<AiTurnMetric | null>((latest, a) => (!latest || a.endMs > latest.endMs ? a : latest), null);
-        if (precedingAi) userResponseLatencies.push(u.startMs - precedingAi.endMs);
-      }
+      // Response latency, overhauled — see the module doc comment's "Response-latency pairing:
+      // conversational adjacency, not nearest-preceding-turn" section for the production incident
+      // that motivated this. Latency is now derived from a single merged, chronologically-ordered
+      // timeline of every AI turn and CONFIRMED user turn, and only STRICTLY ADJACENT pairs in that
+      // merged order ever produce a latency value — never a turn found by scanning further back or
+      // forward. This also yields, as a natural byproduct of the same walk, which confirmed user
+      // turns had no AI turn immediately follow them at all (see unansweredUserTurns below).
+      type MergedTurn =
+        | { kind: "ai"; startMs: number; endMs: number; ai: AiTurnMetric }
+        | { kind: "user"; startMs: number; endMs: number; user: UserTurnMetric };
+      const mergedTimeline: MergedTurn[] = [
+        ...aiTurns.map((ai): MergedTurn => ({ kind: "ai", startMs: ai.startMs, endMs: ai.endMs, ai })),
+        ...confirmedUserTurns.map((user): MergedTurn => ({ kind: "user", startMs: user.startMs, endMs: user.endMs, user })),
+      ].sort((a, b) => a.startMs - b.startMs);
 
-      // AI ("system") response latency: symmetric, but explicitly a product-quality signal, never
-      // used to judge the user — see the module doc comment and /docs/DECISIONS.md. A suspected
-      // noise event must not establish "the user just finished speaking" for this calculation
-      // either.
+      const userResponseLatencies: number[] = [];
       const aiResponseLatencies: number[] = [];
-      for (const a of aiTurns) {
-        const precedingUser = confirmedUserTurns
-          .filter((u) => u.endMs <= a.startMs)
-          .reduce<UserTurnMetric | null>((latest, u) => (!latest || u.endMs > latest.endMs ? u : latest), null);
-        if (precedingUser) aiResponseLatencies.push(a.startMs - precedingUser.endMs);
+      const unansweredUserTurns: UnansweredUserTurnMetric[] = [];
+
+      for (let i = 0; i < mergedTimeline.length; i++) {
+        const current = mergedTimeline[i];
+        const next = mergedTimeline[i + 1] as MergedTurn | undefined;
+
+        if (current.kind === "ai" && next?.kind === "user") {
+          // Overlapping/touching adjacency (e.g. the production case where an AI turn's .stopped
+          // and the next user turn's speech_started land ~0.4ms apart) is NOT ordinary latency —
+          // per the required principle, that observation is left MISSING here, never reassigned to
+          // whatever later user turn happens to satisfy a "no overlap" check.
+          if (next.startMs >= current.endMs) userResponseLatencies.push(next.startMs - current.endMs);
+        } else if (current.kind === "user" && next?.kind === "ai") {
+          if (next.startMs >= current.endMs) aiResponseLatencies.push(next.startMs - current.endMs);
+        }
+
+        // Unanswered/stalled user turn: a confirmed user turn whose immediate successor in the
+        // merged timeline is NOT an AI turn at all — either another later user turn (no AI turn
+        // ever occurred between them) or nothing (session ended). A user turn immediately followed
+        // by an AI turn is "answered" regardless of whether that pairing produced a latency value
+        // above (an overlapping-but-present AI turn is not a stall). Gated by
+        // MIN_UNANSWERED_GAP_MS so an ordinary short VAD-segmented continuation of one utterance
+        // (e.g. two consecutive user turns ~150-200ms apart, no AI turn between them) is never
+        // misreported as a stall.
+        if (current.kind === "user" && next?.kind !== "ai") {
+          const resolvedAtMs = next ? next.startMs : finalizedAtMs;
+          const stalledDurationMs = resolvedAtMs - current.endMs;
+          if (stalledDurationMs >= MIN_UNANSWERED_GAP_MS) {
+            unansweredUserTurns.push({
+              userItemId: current.user.itemId,
+              turnIndex: current.user.turnIndex as number,
+              endMs: current.endMs,
+              resolvedBy: next ? "next_user_turn" : "session_end",
+              stalledDurationMs,
+            });
+          }
+        }
       }
 
       const totalUserSpeakingMs = confirmedUserTurns.reduce((sum, t) => sum + t.durationMs, 0);
@@ -949,6 +1073,9 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
         longestUserResponseLatencyMs: userResponseLatencies.length > 0 ? Math.max(...userResponseLatencies) : null,
         avgAiResponseLatencyMs: average(aiResponseLatencies),
         medianAiResponseLatencyMs: median(aiResponseLatencies),
+        unansweredUserTurnCount: unansweredUserTurns.length,
+        longestUnansweredStallMs:
+          unansweredUserTurns.length > 0 ? Math.max(...unansweredUserTurns.map((t) => t.stalledDurationMs)) : null,
         avgWordsPerMinute: average(wpmValues),
         medianWordsPerMinute: median(wpmValues),
         fastestUserTurnWpm: wpmValues.length > 0 ? Math.max(...wpmValues) : null,
@@ -974,6 +1101,7 @@ export function createSessionTimeline(options: SessionTimelineOptions = {}): Ses
         confirmedBargeIns: [...confirmedBargeIns],
         responseCancellations: [...responseCancellations],
         fillerCandidates,
+        unansweredUserTurns,
         session,
         invariantViolations,
       };
@@ -1016,6 +1144,14 @@ export function formatSessionTimelineDebugLines(snapshot: SessionTimelineSnapsho
   lines.push(`Technical confirmed barge-in (all, incl. pre-playback): ${snapshot.session.technicalBargeInCount}`);
   lines.push(`Overlap: ${snapshot.overlaps.length} interval(s), ${toS(snapshot.session.totalOverlapMs)}s total`);
   lines.push(`Suspected false VAD/noise events excluded: ${snapshot.session.suspectedNoiseEventCount}`);
+  if (snapshot.unansweredUserTurns.length > 0) {
+    lines.push(
+      `UNANSWERED user turn(s) (system non-response evidence, NOT a coaching signal): ${snapshot.session.unansweredUserTurnCount}, longest ${toS(snapshot.session.longestUnansweredStallMs ?? 0)}s`,
+    );
+    for (const u of snapshot.unansweredUserTurns) {
+      lines.push(`  - user turn ${u.turnIndex}: ended ${toS(u.endMs)}s, stalled ${toS(u.stalledDurationMs)}s (resolved by ${u.resolvedBy})`);
+    }
+  }
   if (snapshot.session.avgWordsPerMinute !== null) {
     lines.push(
       `Speaking rate (evidence only, no ideal implied): avg ${snapshot.session.avgWordsPerMinute.toFixed(0)} WPM / median ${(snapshot.session.medianWordsPerMinute ?? 0).toFixed(0)} WPM / fastest ${(snapshot.session.fastestUserTurnWpm ?? 0).toFixed(0)} / slowest ${(snapshot.session.slowestUserTurnWpm ?? 0).toFixed(0)}`,

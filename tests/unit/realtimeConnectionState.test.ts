@@ -57,4 +57,9 @@ describe("realtime connection state machine", () => {
     expect(transitionRealtimeConnection("evaluating", { type: "USER_STARTED_SPEAKING" })).toBe("evaluating");
     expect(transitionRealtimeConnection("connecting", { type: "AI_STARTED_SPEAKING" })).toBe("connecting");
   });
+
+  // Response-stall incident fix — see /docs/DECISIONS.md "Response-stall incident", Part B/G.
+  it("does not remain stuck in thinking indefinitely: a proven-failed response (AI_FINISHED_SPEAKING while thinking) falls back to listening", () => {
+    expect(transitionRealtimeConnection("thinking", { type: "AI_FINISHED_SPEAKING" })).toBe("listening");
+  });
 });

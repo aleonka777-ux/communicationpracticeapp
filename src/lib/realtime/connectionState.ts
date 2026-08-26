@@ -59,6 +59,15 @@ const TRANSITIONS: TransitionTable = {
   thinking: {
     AI_STARTED_SPEAKING: "speaking",
     USER_STARTED_SPEAKING: "user_speaking",
+    // Lifecycle-proven recovery for the response-stall incident (see /docs/DECISIONS.md
+    // "Response-stall incident", Part B/G): the client dispatches this specifically when a
+    // response.done arrives for the response we were waiting on and its status is anything other
+    // than "completed" (failed/cancelled/incomplete) — proof that THIS specific response will never
+    // produce audio, not a guess. Falls back to "listening" (not "speaking", since no audio ever
+    // played) rather than leaving the UI stuck showing "Thinking" indefinitely. This is distinct
+    // from a retry: no new response.create is sent, only the UI label is corrected to match a
+    // proven fact.
+    AI_FINISHED_SPEAKING: "listening",
     END_PRACTICE: "ending",
     TIME_UP: "ending",
     ERROR: "error",

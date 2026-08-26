@@ -28,9 +28,26 @@ import { createSpeechDeliveryTracker, type SpeechDeliveryTracker } from "@/lib/r
 import { startMicEnergyMonitor, type MicEnergyMonitorHandle } from "@/lib/realtime/micEnergyMonitor";
 import { formatSpeechDeliveryDebugLines } from "@/lib/realtime/speechDeliveryDebug";
 import { mergeSpeechDeliveryEvidence } from "@/lib/realtime/mergeSpeechDeliveryEvidence";
+import { safeCall } from "@/lib/realtime/safeCall";
 import type { MetricsPayload } from "@/lib/realtime/metricsPayload";
 
 const NAVIGATION_STALL_TIMEOUT_MS = 8000;
+
+/**
+ * Response-stall incident fix (see /docs/DECISIONS.md "Response-stall incident"): production showed
+ * the UI stuck in "Thinking" for ~43-45 seconds after the AI failed to respond, with nothing in the
+ * client able to detect or recover from it — connectionState.ts has no timeout of its own, and
+ * `response.done`/`error` events never dispatch a state transition regardless of outcome. This is a
+ * RECOVERY AFFORDANCE trigger, not an automatic retry: current Realtime semantics give the client no
+ * reliable way to know whether a response is still silently active server-side (no state-query
+ * capability exists over this transport), so blindly sending another `response.create` risks a
+ * duplicate/overlapping AI reply once a merely-slow response eventually arrives — see the module's
+ * own doc comment at the watchdog effect below for the full reasoning. 12 seconds is deliberately
+ * generous: roughly 20x the ~600ms median AI response latency this app has measured in production,
+ * so it will not fire on an ordinary (if slow) reply, while still firing with more than 30 seconds
+ * to spare against the exact incident that motivated this (a ~43-45s stall).
+ */
+const THINKING_STALL_TIMEOUT_MS = 12000;
 
 export interface RealtimeSimulationClientProps {
   sessionId: string;
@@ -71,6 +88,9 @@ export function RealtimeSimulationClient({
   const [textInput, setTextInput] = useState("");
   const [remaining, setRemaining] = useState(() => computeRemainingSeconds(startedAtIso, durationSeconds));
   const [navigationStalled, setNavigationStalled] = useState(false);
+  /** Set once THINKING_STALL_TIMEOUT_MS elapses while still in "thinking" — a recovery affordance,
+   *  never an automatic response.create retry. See THINKING_STALL_TIMEOUT_MS's doc comment. */
+  const [thinkingStallDetected, setThinkingStallDetected] = useState(false);
 
   const connectionRef = useRef<RealtimeConnection | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement>(null);
@@ -116,10 +136,15 @@ export function RealtimeSimulationClient({
    *  on every reconnect (mirrors bargeInRef's own doc comment: a stale one must never keep feeding
    *  samples after its underlying connection/stream is gone). */
   const micMonitorRef = useRef<MicEnergyMonitorHandle | null>(null);
+  /** Response ids that have already logged their first response.output_audio.delta — see the
+   *  "response.output_audio.delta" case below. Diagnostic-only bookkeeping, never persisted. */
+  const respondedWithFirstDeltaRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+
+  const sessionElapsedMs = useCallback(() => Date.now() - sessionMountedAtRef.current, []);
 
   const logStage = useCallback(
     (stage: Parameters<typeof logFinalizationStage>[1], extra?: Record<string, unknown>) =>
@@ -292,13 +317,14 @@ export function RealtimeSimulationClient({
         onConfirmedBargeIn: () => {
           if (aiAudioSpeechIncidentRef.current) aiAudioSpeechIncidentRef.current.wasInterrupted = true;
           connection.sendEvent({ type: "response.cancel" });
+          logRealtimeDebugEvent(sessionId, "response_cancelled", sessionElapsedMs(), { reason: "confirmed_bargein" });
           // response.cancel alone stops the server from generating further content but does NOT
           // itself drain/stop the output audio buffer — without this, a genuinely interrupted
           // response's output_audio_buffer.stopped can arrive very late or never, leaving its AI
           // turn open for the rest of the session (see sessionTimeline.ts's doc comment on closing
           // an AI turn reliably, and /docs/DECISIONS.md).
           connection.sendEvent({ type: "output_audio_buffer.clear" });
-          logRealtimeDebugEvent(sessionId, "response_cancelled", { reason: "confirmed_bargein" });
+          logRealtimeDebugEvent(sessionId, "output_audio_buffer_clear_sent", sessionElapsedMs(), { reason: "confirmed_bargein" });
           metricsRef.current?.recordConfirmedBargeIn();
           metricsRef.current?.recordResponseCancelled(null, "confirmed_bargein");
           dispatch({ type: "USER_STARTED_SPEAKING" });
@@ -316,7 +342,7 @@ export function RealtimeSimulationClient({
         },
         onMicTrackSettings: (settings) => {
           micSettingsRef.current = settings;
-          logRealtimeDebugEvent(sessionId, "mic_track_settings", { settings });
+          logRealtimeDebugEvent(sessionId, "mic_track_settings", sessionElapsedMs(), { settings });
         },
         onConnectionStateChange: (pcState) => {
           if (pcState === "connected") setPeerConnectivity("connected");
@@ -347,6 +373,7 @@ export function RealtimeSimulationClient({
                     instructions: `Say exactly the following, word for word, and nothing else: "${openingLine}"`,
                   },
                 });
+                logRealtimeDebugEvent(sessionId, "response_create_sent", sessionElapsedMs(), { reason: "opening_line" });
               }
               dispatch({ type: "CONNECTED" });
               break;
@@ -354,19 +381,28 @@ export function RealtimeSimulationClient({
             case "input_audio_buffer.speech_started": {
               const aiWasSpeaking = stateRef.current === "speaking";
               const isFirst = isFirstAiResponseRef.current;
-              logRealtimeDebugEvent(sessionId, "speech_started", {
+              const itemId = String(event.item_id ?? "");
+              logRealtimeDebugEvent(sessionId, "speech_started", sessionElapsedMs(), {
+                itemId,
                 uiState: stateRef.current,
                 aiAudioPlaying: aiWasSpeaking,
                 isFirstAiResponse: isFirst,
-                sessionElapsedMs: Date.now() - sessionMountedAtRef.current,
               });
               // audio_start_ms is the server's own VAD boundary timestamp — the most precise
               // signal available for this turn's eventual duration (see sessionTimeline.ts).
               metricsRef.current?.recordUserSpeechStarted(
-                String(event.item_id ?? ""),
+                itemId,
                 typeof event.audio_start_ms === "number" ? event.audio_start_ms : null,
               );
-              speechDeliveryRef.current?.openTurn(String(event.item_id ?? ""));
+              // Phase 4A evidence collection must never block or break Realtime lifecycle
+              // processing (see /docs/DECISIONS.md "Response-stall incident", Part C) — isolated in
+              // its own try/catch, unlike the trivially-safe sessionTimeline.ts call above, since
+              // this is the specific module audited for that risk. A failure here only means this
+              // turn's pause/intensity evidence is absent, never a broken conversation.
+              safeCall(
+                () => speechDeliveryRef.current?.openTurn(itemId),
+                (error) => console.error("[voice:realtime:speech-delivery] openTurn failed (conversation unaffected)", error instanceof Error ? error.message : error),
+              );
               if (aiWasSpeaking) {
                 const sinceFirstAiAudioMs = firstAiAudioStartAtRef.current ? Date.now() - firstAiAudioStartAtRef.current : null;
                 aiAudioSpeechIncidentRef.current = {
@@ -384,32 +420,43 @@ export function RealtimeSimulationClient({
               break;
             }
             case "input_audio_buffer.speech_stopped": {
-              logRealtimeDebugEvent(sessionId, "speech_stopped");
+              const itemId = String(event.item_id ?? "");
+              logRealtimeDebugEvent(sessionId, "speech_stopped", sessionElapsedMs(), { itemId });
               const incident = aiAudioSpeechIncidentRef.current;
               if (incident) {
-                logRealtimeDebugEvent(sessionId, "speech_started_during_ai_audio", {
+                logRealtimeDebugEvent(sessionId, "speech_started_during_ai_audio", sessionElapsedMs(), {
                   durationMs: Date.now() - incident.startedAt,
                   wasInterrupted: incident.wasInterrupted,
                   isFirstAiResponse: incident.isFirstAiResponse,
                   confirmMsUsed: incident.confirmMsUsed,
-                  sessionElapsedMs: incident.sessionElapsedMs,
                   sinceFirstAiAudioMs: incident.sinceFirstAiAudioMs,
                   // Only worth the extra log volume for the one turn we're actually diagnosing.
                   micSettings: incident.isFirstAiResponse ? micSettingsRef.current : undefined,
                 });
               }
               metricsRef.current?.recordUserSpeechStopped(
-                String(event.item_id ?? ""),
+                itemId,
                 typeof event.audio_end_ms === "number" ? event.audio_end_ms : null,
               );
-              speechDeliveryRef.current?.closeTurn(String(event.item_id ?? ""));
+              safeCall(
+                () => speechDeliveryRef.current?.closeTurn(itemId),
+                (error) => console.error("[voice:realtime:speech-delivery] closeTurn failed (conversation unaffected)", error instanceof Error ? error.message : error),
+              );
               bargeIn.handleSpeechStopped();
+              // The server auto-creates a response for this turn (turn_detection.create_response:
+              // true, see session.ts) — there is no explicit client-sent response.create to log for
+              // ordinary voice turn-taking, so this marker makes the EXPECTATION of one visible,
+              // letting a future reproduction tell "no response.created ever followed" apart from
+              // every other outcome just by scanning forward in this log stream for the next
+              // ai_response_created (or its absence) against this same itemId/timestamp.
+              logRealtimeDebugEvent(sessionId, "automatic_response_expected", sessionElapsedMs(), { triggeringItemId: itemId });
               break;
             }
             case "conversation.item.input_audio_transcription.completed": {
               pendingUserTranscriptionRef.current = false;
               const transcript = String(event.transcript ?? "").trim();
-              logRealtimeDebugEvent(sessionId, "user_transcription_completed", {
+              logRealtimeDebugEvent(sessionId, "user_transcription_completed", sessionElapsedMs(), {
+                itemId: String(event.item_id ?? ""),
                 hasMeaningfulTranscript: transcript.length > 0,
                 followsSpeechDuringAiAudio: aiAudioSpeechIncidentRef.current !== null,
                 isFirstAiResponse: aiAudioSpeechIncidentRef.current?.isFirstAiResponse ?? false,
@@ -424,7 +471,8 @@ export function RealtimeSimulationClient({
             }
             case "conversation.item.input_audio_transcription.failed":
               pendingUserTranscriptionRef.current = false;
-              logRealtimeDebugEvent(sessionId, "user_transcription_failed", {
+              logRealtimeDebugEvent(sessionId, "user_transcription_failed", sessionElapsedMs(), {
+                itemId: String(event.item_id ?? ""),
                 followsSpeechDuringAiAudio: aiAudioSpeechIncidentRef.current !== null,
                 isFirstAiResponse: aiAudioSpeechIncidentRef.current?.isFirstAiResponse ?? false,
               });
@@ -439,44 +487,75 @@ export function RealtimeSimulationClient({
               // the same order, so audio could otherwise start reaching the speaker fractionally
               // before our own state caught up, during which an echo-triggered speech_started
               // would bypass the confirmation window entirely.
-              logRealtimeDebugEvent(sessionId, "ai_response_created", { isFirstAiResponse: isFirstAiResponseRef.current });
+              const responseId = (event.response as { id?: string } | undefined)?.id;
+              logRealtimeDebugEvent(sessionId, "ai_response_created", sessionElapsedMs(), {
+                responseId,
+                isFirstAiResponse: isFirstAiResponseRef.current,
+              });
               bargeIn.handleAiSpeakingChanged(true);
               // Lets a confirmed barge-in that lands before this response ever produces audio
               // still be attributed to it instead of recording a null aiResponseId — see
               // sessionTimeline.ts's doc comment on this exact gap.
-              const responseId = (event.response as { id?: string } | undefined)?.id;
               if (responseId) metricsRef.current?.recordResponseCreated(responseId);
+              break;
+            }
+            case "response.output_audio.delta": {
+              // Only the FIRST delta per response is logged — deltas can stream many times per
+              // response, and this is a one-shot lifecycle marker ("output has genuinely begun
+              // generating"), not a per-chunk trace. Distinguishes "response created but no output"
+              // from "output generated but playback never started" (output_audio_buffer.started can
+              // itself lag behind the first delta — see /docs/DECISIONS.md "Response-stall
+              // incident", Part F).
+              const responseId = event.response_id as string | undefined;
+              if (responseId && !respondedWithFirstDeltaRef.current.has(responseId)) {
+                respondedWithFirstDeltaRef.current.add(responseId);
+                logRealtimeDebugEvent(sessionId, "first_output_audio_delta", sessionElapsedMs(), { responseId });
+              }
               break;
             }
             case "response.done": {
               // Always emitted, regardless of outcome (completed/cancelled/failed) — the reliable
               // backstop for clearing "AI is speaking" even if a response never actually produced
               // any audio at all, so this flag can never get stuck true from response.created above.
-              logRealtimeDebugEvent(sessionId, "ai_response_done", { isFirstAiResponse: isFirstAiResponseRef.current });
-              bargeIn.handleAiSpeakingChanged(false);
               const response = event.response as { id?: string; status?: string } | undefined;
+              logRealtimeDebugEvent(sessionId, "ai_response_done", sessionElapsedMs(), {
+                responseId: response?.id,
+                status: response?.status,
+                isFirstAiResponse: isFirstAiResponseRef.current,
+              });
+              bargeIn.handleAiSpeakingChanged(false);
               if (response?.id && response.status) {
                 metricsRef.current?.recordResponseDone(response.id, response.status as AiResponseStatus);
+              }
+              // Lifecycle-proven recovery (see /docs/DECISIONS.md "Response-stall incident", Part
+              // B/G, and connectionState.ts's own doc comment on this transition): if we are still
+              // "thinking" (waiting for a reply) and THIS response has now definitively concluded
+              // without ever completing normally, there is nothing left to wait for from it — stop
+              // showing "Thinking". Not a retry: no response.create is sent here. A "completed"
+              // response never needs this, since output_audio_buffer.stopped already dispatched
+              // AI_STARTED_SPEAKING/AI_FINISHED_SPEAKING for it.
+              if (stateRef.current === "thinking" && response?.status && response.status !== "completed") {
+                dispatch({ type: "AI_FINISHED_SPEAKING" });
               }
               break;
             }
             case "output_audio_buffer.started": {
               if (firstAiAudioStartAtRef.current === null) firstAiAudioStartAtRef.current = Date.now();
-              logRealtimeDebugEvent(sessionId, "ai_audio_started", {
+              const responseId = event.response_id as string | undefined;
+              logRealtimeDebugEvent(sessionId, "ai_audio_started", sessionElapsedMs(), {
+                responseId,
                 isFirstAiResponse: isFirstAiResponseRef.current,
-                sessionElapsedMs: Date.now() - sessionMountedAtRef.current,
               });
               bargeIn.handleAiSpeakingChanged(true);
               dispatch({ type: "AI_STARTED_SPEAKING" });
-              const responseId = event.response_id as string | undefined;
               if (responseId) metricsRef.current?.recordAiAudioStarted(responseId);
               break;
             }
             case "output_audio_buffer.stopped": {
-              logRealtimeDebugEvent(sessionId, "ai_audio_completed", { isFirstAiResponse: isFirstAiResponseRef.current });
+              const responseId = event.response_id as string | undefined;
+              logRealtimeDebugEvent(sessionId, "ai_audio_completed", sessionElapsedMs(), { responseId, isFirstAiResponse: isFirstAiResponseRef.current });
               bargeIn.handleAiSpeakingChanged(false);
               dispatch({ type: "AI_FINISHED_SPEAKING" });
-              const responseId = event.response_id as string | undefined;
               if (responseId) metricsRef.current?.recordAiAudioStopped(responseId);
               // The startup-specific protection only ever applies to this one, first AI turn —
               // every turn after it reverts to the normal, shorter confirmation window.
@@ -489,10 +568,10 @@ export function RealtimeSimulationClient({
               // naturally drained — the server-confirmed signal that this response's audio was cut
               // off. Closes the AI turn exactly like output_audio_buffer.stopped, so an interrupted
               // turn never stays open until session finalize (see sessionTimeline.ts's doc comment).
-              logRealtimeDebugEvent(sessionId, "ai_audio_cleared", { isFirstAiResponse: isFirstAiResponseRef.current });
+              const responseId = event.response_id as string | undefined;
+              logRealtimeDebugEvent(sessionId, "ai_audio_cleared", sessionElapsedMs(), { responseId, isFirstAiResponse: isFirstAiResponseRef.current });
               bargeIn.handleAiSpeakingChanged(false);
               dispatch({ type: "AI_FINISHED_SPEAKING" });
-              const responseId = event.response_id as string | undefined;
               if (responseId) metricsRef.current?.recordAiAudioCleared(responseId);
               isFirstAiResponseRef.current = false;
               break;
@@ -516,6 +595,15 @@ export function RealtimeSimulationClient({
             }
             case "error":
               console.error("[voice:realtime] server-reported error (session continues)", event.error);
+              // Also routed through the structured debug stream (with session-elapsed timing and
+              // current uiState) so an error is correlatable against every other lifecycle event —
+              // previously this was console.error-only, invisible in the same timeline. Note this
+              // event alone never clears "thinking"/any UI state — see the module doc comment on
+              // THINKING_STALL_TIMEOUT_MS and /docs/DECISIONS.md "Response-stall incident", Part B.
+              logRealtimeDebugEvent(sessionId, "realtime_error", sessionElapsedMs(), {
+                uiState: stateRef.current,
+                error: event.error,
+              });
               break;
             default:
               break;
@@ -531,7 +619,14 @@ export function RealtimeSimulationClient({
       // conversation itself, only leave pause/intensity evidence absent for this connection.
       try {
         micMonitorRef.current = startMicEnergyMonitor(connection.localStream, (rms) => {
-          speechDeliveryRef.current?.pushEnergySample(rms);
+          // This callback runs on its own setInterval tick, entirely outside the Realtime
+          // onServerEvent handler — but is still wrapped defensively, since an uncaught throw here
+          // could otherwise surface as a noisy unhandled-error report with no other benefit (see
+          // /docs/DECISIONS.md "Response-stall incident", Part C).
+          safeCall(
+            () => speechDeliveryRef.current?.pushEnergySample(rms),
+            (error) => console.error("[voice:realtime:speech-delivery] pushEnergySample failed (conversation unaffected)", error instanceof Error ? error.message : error),
+          );
         });
       } catch (error) {
         console.error("[voice:realtime] mic energy monitor failed to start (conversation unaffected)", error instanceof Error ? error.message : error);
@@ -550,7 +645,7 @@ export function RealtimeSimulationClient({
     } finally {
       connectingRef.current = false;
     }
-  }, [sessionId, enqueueTranscript]);
+  }, [sessionId, enqueueTranscript, sessionElapsedMs]);
 
   useEffect(() => {
     metricsRef.current = createSessionTimeline();
@@ -603,6 +698,27 @@ export function RealtimeSimulationClient({
     return () => clearTimeout(timeout);
   }, [state, logStage]);
 
+  // Response-stall watchdog — see THINKING_STALL_TIMEOUT_MS's doc comment and /docs/DECISIONS.md
+  // "Response-stall incident", Part G. Deliberately NOT an automatic response.create retry: current
+  // Realtime semantics give the client no way to confirm whether a response is still silently
+  // active server-side (no state-query capability over this transport), so blindly sending another
+  // response.create risks a duplicate/overlapping AI reply if the "stuck" one eventually resolves
+  // on its own. Instead this only surfaces a recovery affordance (reveals the existing "type
+  // instead" text fallback and an explanatory notice) and logs a diagnostic — the human decides
+  // whether to keep waiting or switch to text, rather than the client guessing.
+  useEffect(() => {
+    setThinkingStallDetected(false);
+    if (state !== "thinking") return;
+    const timeout = setTimeout(() => {
+      logRealtimeDebugEvent(sessionId, "thinking_stall_detected", sessionElapsedMs(), {
+        thinkingStallTimeoutMs: THINKING_STALL_TIMEOUT_MS,
+      });
+      setThinkingStallDetected(true);
+      setShowTextFallback(true);
+    }, THINKING_STALL_TIMEOUT_MS);
+    return () => clearTimeout(timeout);
+  }, [state, sessionId, sessionElapsedMs]);
+
   function handleEndPractice() {
     logStage("end_practice_requested");
     void finishAndEvaluate("manual");
@@ -621,6 +737,7 @@ export function RealtimeSimulationClient({
       item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
     });
     connection.sendEvent({ type: "response.create" });
+    logRealtimeDebugEvent(sessionId, "response_create_sent", sessionElapsedMs(), { reason: "text_fallback" });
   }
 
   function handleRetry() {
@@ -716,6 +833,12 @@ export function RealtimeSimulationClient({
               </Link>
             ) : null}
           </div>
+        </div>
+      ) : null}
+
+      {thinkingStallDetected && state === "thinking" ? (
+        <div className="mb-3 flex flex-col items-center gap-1 rounded-xl bg-surface-muted px-4 py-3 text-center text-sm text-foreground-muted">
+          <span>{aiLabel} is taking longer than usual to respond. You can keep waiting, or type your response instead.</span>
         </div>
       ) : null}
 

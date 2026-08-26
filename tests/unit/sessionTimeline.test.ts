@@ -470,6 +470,13 @@ describe("createSessionTimeline", () => {
       "contextBefore",
       "contextAfter",
       "approxSessionMs",
+      // Response-stall incident fix — system/product-quality diagnostic only, never a coaching
+      // signal. See sessionTimeline.ts's UnansweredUserTurnMetric doc comment.
+      "unansweredUserTurns",
+      "resolvedBy",
+      "stalledDurationMs",
+      "unansweredUserTurnCount",
+      "longestUnansweredStallMs",
     ]);
 
     function assertNoAudioFields(value: unknown): void {
@@ -1541,5 +1548,143 @@ describe("createSessionTimeline — Phase 4A filler/disfluency candidates", () =
     const snapshot = timeline.finalize();
     expect(snapshot.session.candidateRatePer100Words).not.toBeNull();
     expect(snapshot.session.candidateRatePerMinuteSpeaking).not.toBeNull();
+  });
+});
+
+describe("createSessionTimeline — response-stall incident (conversational-adjacency latency pairing)", () => {
+  it("pairs a normal adjacent AI-then-user turn with ordinary latency", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(2000);
+    timeline.recordAiAudioStopped("resp_1");
+    timeline.recordResponseDone("resp_1", "completed");
+
+    clock.advance(700);
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(1500);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "That sounds reasonable to me");
+
+    const snapshot = timeline.finalize();
+    expect(snapshot.session.avgUserResponseLatencyMs).toBe(700);
+    expect(snapshot.session.longestUserResponseLatencyMs).toBe(700);
+    expect(snapshot.session.unansweredUserTurnCount).toBe(0);
+  });
+
+  it("reproduces the exact production incident: a ~45s system stall is never attributed as user_response_latency, and the immediately-preceding overlapping AI turn is never skipped past", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    // ai_turn 4: 58436.0 -> 76599.7 (duration 18163.7)
+    timeline.recordAiAudioStarted("resp_4");
+    clock.advance(18163.7);
+    timeline.recordAiAudioStopped("resp_4");
+    timeline.recordResponseDone("resp_4", "completed");
+
+    // user_turn 6: starts 1120.8ms after ai_turn 4 ends, duration 6417.6ms
+    clock.advance(1120.8);
+    timeline.recordUserSpeechStarted("item_6");
+    clock.advance(6417.6);
+    timeline.recordUserSpeechStopped("item_6");
+    timeline.recordUserTranscript("item_6", "I wanted to follow up on something we discussed");
+
+    // user_turn 7: a VAD-segmented continuation, only 149.5ms after user_turn 6 ends
+    clock.advance(149.5);
+    timeline.recordUserSpeechStarted("item_7");
+    clock.advance(2099.8);
+    timeline.recordUserSpeechStopped("item_7");
+    timeline.recordUserTranscript("item_7", "specifically about the schedule change");
+
+    // ai_turn 5: the 22ms turn, starting 420.4ms after user_turn 7 ends
+    clock.advance(420.4);
+    timeline.recordAiAudioStarted("resp_5");
+    // user_turn 8 starts 21.6ms after ai_turn 5 starts — 0.4ms BEFORE ai_turn 5 ends (the production
+    // overlap that must exclude this pair from latency, without skipping ahead to a later turn).
+    clock.advance(21.6);
+    timeline.recordUserSpeechStarted("item_8");
+    clock.advance(0.4);
+    timeline.recordAiAudioStopped("resp_5");
+    timeline.recordResponseDone("resp_5", "completed");
+    clock.advance(1693.0);
+    timeline.recordUserSpeechStopped("item_8");
+    timeline.recordUserTranscript("item_8", "Actually never mind, let me explain differently");
+
+    // THE STALL: 43459.8ms of complete silence — no ai_turn at all.
+    clock.advance(43459.8);
+    timeline.recordUserSpeechStarted("item_9");
+    clock.advance(867.4);
+    timeline.recordUserSpeechStopped("item_9");
+    timeline.recordUserTranscript("item_9", "Hello, are you still there");
+
+    // ai_turn 6 finally responds.
+    clock.advance(825.9);
+    timeline.recordAiAudioStarted("resp_6");
+    clock.advance(5911.3);
+    timeline.recordAiAudioStopped("resp_6");
+    timeline.recordResponseDone("resp_6", "completed");
+
+    const snapshot = timeline.finalize();
+
+    // The exact production bug: this must NEVER appear.
+    expect(snapshot.session.longestUserResponseLatencyMs).not.toBeCloseTo(45152.4, 0);
+    expect(snapshot.session.avgUserResponseLatencyMs).not.toBeCloseTo(45152.4, 0);
+
+    // user_turn 6 is the only one with a valid, non-overlapping preceding AI turn (ai_turn 4).
+    expect(snapshot.session.longestUserResponseLatencyMs).toBeCloseTo(1120.8, 5);
+    expect(snapshot.session.avgUserResponseLatencyMs).toBeCloseTo(1120.8, 5);
+
+    // The stall is captured as unanswered/system evidence, not as a user latency value.
+    expect(snapshot.session.unansweredUserTurnCount).toBe(1);
+    expect(snapshot.session.longestUnansweredStallMs).toBeCloseTo(43459.8, 1);
+    expect(snapshot.unansweredUserTurns).toHaveLength(1);
+    expect(snapshot.unansweredUserTurns[0].userItemId).toBe("item_8");
+    expect(snapshot.unansweredUserTurns[0].resolvedBy).toBe("next_user_turn");
+
+    // The short-but-genuine VAD segmentation (user_turn 6 -> user_turn 7, 149.5ms gap) must NOT be
+    // reported as an unanswered/stalled turn — it's an ordinary continuation of one utterance.
+    expect(snapshot.unansweredUserTurns.some((u) => u.userItemId === "item_6")).toBe(false);
+
+    // ai_turn 5's own AI-facing latency (paired against user_turn 7, its true adjacent predecessor)
+    // is still captured correctly — a short (22ms) AI turn is not disqualified from pairing.
+    expect(snapshot.session.avgAiResponseLatencyMs).not.toBeNull();
+  });
+
+  it("does not let a cancelled/pre-playback response (no AiTurnMetric at all) confuse adjacency pairing", () => {
+    const clock = createClock();
+    const timeline = createSessionTimeline({ now: clock.now });
+
+    timeline.recordAiAudioStarted("resp_1");
+    clock.advance(2000);
+    timeline.recordAiAudioStopped("resp_1");
+    timeline.recordResponseDone("resp_1", "completed");
+
+    clock.advance(500);
+    timeline.recordUserSpeechStarted("item_1");
+    clock.advance(300);
+    // A response created and cancelled before ever producing audio — no AiTurnMetric is created for
+    // it (see the module's own "response.created -> output_audio_buffer.started gap" doc comment).
+    timeline.recordResponseCreated("resp_2");
+    timeline.recordConfirmedBargeIn();
+    timeline.recordResponseCancelled("resp_2", "confirmed_bargein");
+    timeline.recordResponseDone("resp_2", "cancelled");
+    clock.advance(1000);
+    timeline.recordUserSpeechStopped("item_1");
+    timeline.recordUserTranscript("item_1", "Let me clarify what I meant just now");
+
+    clock.advance(600);
+    timeline.recordAiAudioStarted("resp_3");
+    clock.advance(3000);
+    timeline.recordAiAudioStopped("resp_3");
+    timeline.recordResponseDone("resp_3", "completed");
+
+    const snapshot = timeline.finalize();
+    // Only two real AI turns exist (resp_1, resp_3) — resp_2 never became a turn.
+    expect(snapshot.aiTurns.map((t) => t.responseId)).toEqual(["resp_1", "resp_3"]);
+    // item_1's latency is paired against resp_1 (its true adjacent predecessor), unaffected by the
+    // cancelled resp_2 in between.
+    expect(snapshot.session.avgUserResponseLatencyMs).toBeCloseTo(500, 5);
+    expect(snapshot.session.unansweredUserTurnCount).toBe(0);
   });
 });
