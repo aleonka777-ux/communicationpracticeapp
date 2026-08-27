@@ -29,9 +29,8 @@ import { startMicEnergyMonitor, type MicEnergyMonitorHandle } from "@/lib/realti
 import { formatSpeechDeliveryDebugLines } from "@/lib/realtime/speechDeliveryDebug";
 import { mergeSpeechDeliveryEvidence } from "@/lib/realtime/mergeSpeechDeliveryEvidence";
 import { safeCall } from "@/lib/realtime/safeCall";
+import { createNavigationRecovery, type NavigationRecovery } from "@/lib/practice/navigationRecovery";
 import type { MetricsPayload } from "@/lib/realtime/metricsPayload";
-
-const NAVIGATION_STALL_TIMEOUT_MS = 8000;
 
 /**
  * Response-stall incident fix (see /docs/DECISIONS.md "Response-stall incident"): production showed
@@ -124,6 +123,10 @@ export function RealtimeSimulationClient({
   const sessionMountedAtRef = useRef(Date.now());
   const firstAiAudioStartAtRef = useRef<number | null>(null);
   const micSettingsRef = useRef<MediaTrackSettings | null>(null);
+  /** Owns the post-evaluation soft-navigation + stall watchdog — see navigationRecovery.ts. Started
+   *  once, right when navigation begins; cancelled on unmount (the proof navigation genuinely
+   *  landed — see the mount effect's cleanup below and navigationRecovery.ts's own doc comment). */
+  const navigationRecoveryRef = useRef<NavigationRecovery | null>(null);
   /** The bargeIn controller from the most recent connect() attempt — tracked so a reconnect can
    *  reset() the PREVIOUS instance's pending confirmation timer before abandoning it. A real
    *  setTimeout does not get cancelled just because its enclosing closure is abandoned: without
@@ -265,7 +268,22 @@ export function RealtimeSimulationClient({
         dispatch({ type: "EVALUATION_COMPLETE" });
         navigationStartedAtRef.current = Date.now();
         logStage("navigation_started");
-        router.push(`/practice/${sessionId}/feedback`);
+        const feedbackUrl = `/practice/${sessionId}/feedback`;
+        // See /docs/DECISIONS.md "Navigation-latency fix": router.push() returns void (no
+        // completion signal), so this arms a watchdog that automatically falls back to a full-page
+        // navigation if this component is still mounted (i.e. navigation genuinely never landed)
+        // after NAVIGATION_STALL_TIMEOUT_MS — evaluation is already persisted by this point, so a
+        // fresh GET to the same URL is always safe. cancel() is called on unmount below, the proof
+        // navigation actually succeeded.
+        navigationRecoveryRef.current = createNavigationRecovery({
+          softNavigate: () => router.push(feedbackUrl),
+          hardNavigate: () => window.location.assign(feedbackUrl),
+          onStalled: () => {
+            logStage("navigation_stalled");
+            setNavigationStalled(true);
+          },
+        });
+        navigationRecoveryRef.current.start();
       } catch (error) {
         endTriggeredRef.current = false;
         const message = error instanceof Error ? error.message : "Couldn't generate feedback.";
@@ -676,7 +694,9 @@ export function RealtimeSimulationClient({
       micMonitorRef.current = null;
       // This component unmounts when navigation away actually lands — logging here (rather than
       // right after router.push) is what tells us navigation genuinely completed, as opposed to
-      // silently stalling with the old page still mounted (see navigationStalled below).
+      // silently stalling with the old page still mounted (see navigationStalled below). This is
+      // also the proof that lets the watchdog stop: cancel() before it ever fires.
+      navigationRecoveryRef.current?.cancel();
       if (navigationStartedAtRef.current) {
         logFinalizationStage(sessionId, "navigation_completed", {
           elapsedMs: Date.now() - navigationStartedAtRef.current,
@@ -703,17 +723,6 @@ export function RealtimeSimulationClient({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state, startedAtIso, durationSeconds]);
 
-  // router.push() is fire-and-forget — it returns void and never surfaces a stalled or failed
-  // background navigation. If evaluation succeeded but this component is still mounted well after
-  // navigation was requested, offer a manual way out rather than leaving the user stuck forever.
-  useEffect(() => {
-    if (state !== "complete") return;
-    const timeout = setTimeout(() => {
-      logStage("navigation_stalled");
-      setNavigationStalled(true);
-    }, NAVIGATION_STALL_TIMEOUT_MS);
-    return () => clearTimeout(timeout);
-  }, [state, logStage]);
 
   // Response-stall watchdog — see THINKING_STALL_TIMEOUT_MS's doc comment and /docs/DECISIONS.md
   // "Response-stall incident", Part G. Deliberately NOT an automatic response.create retry: current
@@ -861,14 +870,15 @@ export function RealtimeSimulationClient({
 
       {navigationStalled ? (
         <div className="mb-3 flex flex-col items-center gap-2 rounded-xl bg-surface-muted px-4 py-3 text-center text-sm text-foreground-muted">
-          <span>Your feedback is ready, but we couldn&apos;t automatically open it.</span>
+          <span>Your feedback is ready — opening it now.</span>
           <Button
             type="button"
             size="sm"
             onClick={() => {
-              // A plain full-page navigation, deliberately not router.push() — this is the
-              // recovery path for exactly the case where the client-side router already failed
-              // to get us here. Evaluation already succeeded, so this only re-reads it, never
+              // navigationRecovery.ts already triggers this same full-page navigation
+              // automatically the instant the watchdog fires — this button is a manual backstop
+              // only, for the rare case that automatic call didn't take effect (e.g. blocked by a
+              // browser extension). Evaluation already succeeded, so this only re-reads it, never
               // re-runs it.
               window.location.assign(`/practice/${sessionId}/feedback`);
             }}

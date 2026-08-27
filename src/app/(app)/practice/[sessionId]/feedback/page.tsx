@@ -15,12 +15,18 @@ export default async function FeedbackPage({ params }: { params: Promise<{ sessi
   } = await supabase.auth.getUser();
   if (!user) redirect("/login");
 
-  const session = await getSessionWithContext(supabase, sessionId);
+  // Independent reads — run concurrently rather than sequentially. By the time this page is
+  // reached, /api/practice/end has already persisted both rows (see /docs/DECISIONS.md
+  // "Navigation-latency fix: parallelize destination-route reads"), so neither result depends on
+  // the other; there is no reason to pay for two sequential round trips here.
+  const [session, evaluation] = await Promise.all([
+    getSessionWithContext(supabase, sessionId),
+    getEvaluationForSession(supabase, sessionId),
+  ]);
   if (!session || session.user_id !== user.id) notFound();
 
   if (session.status === "in_progress") redirect(`/practice/${sessionId}`);
 
-  const evaluation = await getEvaluationForSession(supabase, sessionId);
   if (!evaluation) {
     return <EvaluationPending sessionId={sessionId} />;
   }
