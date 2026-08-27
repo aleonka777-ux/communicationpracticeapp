@@ -63,3 +63,78 @@ describe("realtime connection state machine", () => {
     expect(transitionRealtimeConnection("thinking", { type: "AI_FINISHED_SPEAKING" })).toBe("listening");
   });
 });
+
+// State-machine race: Thinking shown during audible AI playback — see /docs/DECISIONS.md.
+describe("realtime connection state machine — user-stop / AI-speaking race", () => {
+  it("1. normal: user stops with no AI turn in flight -> thinking -> AI starts -> speaking", () => {
+    let state: RealtimeConnectionState = "listening";
+    state = transitionRealtimeConnection(state, { type: "USER_STARTED_SPEAKING" });
+    expect(state).toBe("user_speaking");
+    state = transitionRealtimeConnection(state, { type: "USER_STOPPED_SPEAKING", aiSpeaking: false });
+    expect(state).toBe("thinking");
+    state = transitionRealtimeConnection(state, { type: "AI_STARTED_SPEAKING" });
+    expect(state).toBe("speaking");
+  });
+
+  it("2. production race reproduced: AI starts while the user is still mid-turn -> state stays/becomes speaking, never thinking, once the user stops", () => {
+    // user_turn 9 starts (thinking -> user_speaking)
+    let state: RealtimeConnectionState = "thinking";
+    state = transitionRealtimeConnection(state, { type: "USER_STARTED_SPEAKING" });
+    expect(state).toBe("user_speaking");
+
+    // ai_turn 8 starts ~683ms later, while the user is still talking (production: 101535.4 -> 102218.2)
+    state = transitionRealtimeConnection(state, { type: "AI_STARTED_SPEAKING" });
+    expect(state).toBe("speaking");
+
+    // user_turn 9 stops ~46.7ms after the AI started (production: 102218.2 -> 102264.9) — must NOT
+    // become "thinking" even though the dispatch is still USER_STOPPED_SPEAKING.
+    state = transitionRealtimeConnection(state, { type: "USER_STOPPED_SPEAKING", aiSpeaking: true });
+    expect(state).toBe("speaking");
+  });
+
+  it("3. reverse order: AI already speaking before the user starts (barge-in-shaped overlap) -> user stops while AI still speaking -> stays speaking", () => {
+    let state: RealtimeConnectionState = "speaking"; // AI already genuinely playing
+    state = transitionRealtimeConnection(state, { type: "USER_STARTED_SPEAKING" });
+    expect(state).toBe("user_speaking");
+    // AI never stopped in between — real evidence says aiSpeaking is still true.
+    state = transitionRealtimeConnection(state, { type: "USER_STOPPED_SPEAKING", aiSpeaking: true });
+    expect(state).toBe("speaking");
+  });
+
+  it("4. AI stops after the user already stopped -> correct subsequent state (listening)", () => {
+    let state: RealtimeConnectionState = "speaking";
+    state = transitionRealtimeConnection(state, { type: "USER_STARTED_SPEAKING" });
+    state = transitionRealtimeConnection(state, { type: "USER_STOPPED_SPEAKING", aiSpeaking: true });
+    expect(state).toBe("speaking");
+    state = transitionRealtimeConnection(state, { type: "AI_FINISHED_SPEAKING" });
+    expect(state).toBe("listening");
+  });
+
+  it("does not use the aiSpeaking override when AI is genuinely not speaking — user_speaking -> thinking still works normally", () => {
+    expect(transitionRealtimeConnection("user_speaking", { type: "USER_STOPPED_SPEAKING", aiSpeaking: false })).toBe("thinking");
+    expect(transitionRealtimeConnection("user_speaking", { type: "USER_STOPPED_SPEAKING" })).toBe("thinking");
+  });
+
+  it("the aiSpeaking override only applies to USER_STOPPED_SPEAKING from user_speaking, not other states/events", () => {
+    // Unrelated event + aiSpeaking present should not do anything unexpected.
+    expect(transitionRealtimeConnection("listening", { type: "USER_STARTED_SPEAKING", aiSpeaking: true })).toBe("user_speaking");
+    // USER_STOPPED_SPEAKING has no effect at all from states other than user_speaking.
+    expect(transitionRealtimeConnection("listening", { type: "USER_STOPPED_SPEAKING", aiSpeaking: true })).toBe("listening");
+  });
+
+  // 5. Genuine response-stall behavior (unrelated to this race) must remain intact: with no AI turn
+  // in flight at all, the user stopping still correctly enters — and stays in — "thinking" long
+  // enough for the (component-level) 12s watchdog to observe it; this fix must not change that path.
+  it("5. a genuinely stalled response (no AI turn at all) still enters thinking and stays there under further unrelated events, exactly as before this fix", () => {
+    let state: RealtimeConnectionState = "listening";
+    state = transitionRealtimeConnection(state, { type: "USER_STARTED_SPEAKING" });
+    state = transitionRealtimeConnection(state, { type: "USER_STOPPED_SPEAKING", aiSpeaking: false });
+    expect(state).toBe("thinking");
+    // No AI_STARTED_SPEAKING ever arrives (the stall) — state must remain "thinking" for the
+    // watchdog to eventually observe, not silently move on its own.
+    expect(transitionRealtimeConnection(state, { type: "USER_STARTED_SPEAKING" })).toBe("user_speaking");
+    // The existing lifecycle-proven recovery (a definitively-failed response) still works exactly
+    // as it did before this change.
+    expect(transitionRealtimeConnection(state, { type: "AI_FINISHED_SPEAKING" })).toBe("listening");
+  });
+});

@@ -114,6 +114,13 @@ export function RealtimeSimulationClient({
   } | null>(null);
   /** True until the AI's first turn (the opening line) finishes — see src/lib/realtime/startupGuard.ts. */
   const isFirstAiResponseRef = useRef(true);
+  /** Real concurrent evidence of whether AI audio is CURRENTLY, actually playing — true from
+   *  `output_audio_buffer.started` until `.stopped`/`.cleared`. Distinct from bargeIn.ts's own
+   *  internal "aiSpeaking" flag, which deliberately also covers the earlier `response.created`
+   *  pre-playback window for a different purpose (echo protection during that gap) — this ref
+   *  tracks audible playback specifically, since that's the fact the UI must reflect. See
+   *  /docs/DECISIONS.md "State-machine race: Thinking shown during audible AI playback". */
+  const aiAudioPlayingRef = useRef(false);
   const sessionMountedAtRef = useRef(Date.now());
   const firstAiAudioStartAtRef = useRef<number | null>(null);
   const micSettingsRef = useRef<MediaTrackSettings | null>(null);
@@ -286,6 +293,9 @@ export function RealtimeSimulationClient({
     // applies again, not just on the very first connection attempt of the session.
     isFirstAiResponseRef.current = true;
     firstAiAudioStartAtRef.current = null;
+    // A stale connection's AI audio (if any) is gone once we reconnect — never let a leftover
+    // `true` from a previous, now-abandoned connection attempt affect this one's state decisions.
+    aiAudioPlayingRef.current = false;
     // Cancel any still-pending confirmation timer from a previous, now-abandoned connection attempt
     // before creating a new bargeIn controller for this one — see bargeInRef's own doc comment.
     bargeInRef.current?.reset();
@@ -331,7 +341,11 @@ export function RealtimeSimulationClient({
         },
         onSpeechStoppedAfterReport: () => {
           pendingUserTranscriptionRef.current = true;
-          dispatch({ type: "USER_STOPPED_SPEAKING" });
+          // Real concurrent evidence, not a guess: if AI audio is already, actually playing at
+          // this exact instant, the state machine resolves to "speaking" instead of "thinking" —
+          // see connectionState.ts's own doc comment and /docs/DECISIONS.md "State-machine race:
+          // Thinking shown during audible AI playback".
+          dispatch({ type: "USER_STOPPED_SPEAKING", aiSpeaking: aiAudioPlayingRef.current });
         },
       });
       bargeInRef.current = bargeIn;
@@ -546,6 +560,7 @@ export function RealtimeSimulationClient({
                 responseId,
                 isFirstAiResponse: isFirstAiResponseRef.current,
               });
+              aiAudioPlayingRef.current = true;
               bargeIn.handleAiSpeakingChanged(true);
               dispatch({ type: "AI_STARTED_SPEAKING" });
               if (responseId) metricsRef.current?.recordAiAudioStarted(responseId);
@@ -554,6 +569,7 @@ export function RealtimeSimulationClient({
             case "output_audio_buffer.stopped": {
               const responseId = event.response_id as string | undefined;
               logRealtimeDebugEvent(sessionId, "ai_audio_completed", sessionElapsedMs(), { responseId, isFirstAiResponse: isFirstAiResponseRef.current });
+              aiAudioPlayingRef.current = false;
               bargeIn.handleAiSpeakingChanged(false);
               dispatch({ type: "AI_FINISHED_SPEAKING" });
               if (responseId) metricsRef.current?.recordAiAudioStopped(responseId);
@@ -570,6 +586,7 @@ export function RealtimeSimulationClient({
               // turn never stays open until session finalize (see sessionTimeline.ts's doc comment).
               const responseId = event.response_id as string | undefined;
               logRealtimeDebugEvent(sessionId, "ai_audio_cleared", sessionElapsedMs(), { responseId, isFirstAiResponse: isFirstAiResponseRef.current });
+              aiAudioPlayingRef.current = false;
               bargeIn.handleAiSpeakingChanged(false);
               dispatch({ type: "AI_FINISHED_SPEAKING" });
               if (responseId) metricsRef.current?.recordAiAudioCleared(responseId);
