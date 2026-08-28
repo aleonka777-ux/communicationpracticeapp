@@ -16,6 +16,7 @@ import { waitForPendingUserTranscription } from "@/lib/realtime/pendingTranscrip
 import { waitForCurrentExchangeToFinish } from "@/lib/realtime/exchangeCompletion";
 import { logFinalizationStage } from "@/lib/realtime/finalizationLog";
 import { createBargeInController, DEFAULT_BARGE_IN_CONFIRM_MS, type BargeInController } from "@/lib/realtime/bargeIn";
+import { createResponseLifecycleTracker, type ResponseLifecycleTracker } from "@/lib/realtime/responseLifecycle";
 import { computeStartupConfirmMs } from "@/lib/realtime/startupGuard";
 import { logRealtimeDebugEvent } from "@/lib/realtime/debugLog";
 import {
@@ -134,6 +135,11 @@ export function RealtimeSimulationClient({
    *  against a since-replaced connection, recording a spurious confirmed-barge-in metric event
    *  uncorrelated with anything the user actually did. */
   const bargeInRef = useRef<BargeInController | null>(null);
+  /** Tracks the OpenAI "at most one active response" invariant explicitly and gates the
+   *  conversation_already_has_active_response recovery — see responseLifecycle.ts's own doc
+   *  comment. Recreated fresh on every connect() attempt, exactly like bargeInRef: whatever a
+   *  previous, now-abandoned connection believed was "active" is meaningless after a reconnect. */
+  const responseLifecycleRef = useRef<ResponseLifecycleTracker | null>(null);
   /** Objective timing/interruption measurement layer — spans the whole practice session (created
    *  once at mount), not per WebRTC connection attempt, since a reconnect is a technical hiccup,
    *  not a new session from the user's or the metrics' point of view. See sessionTimeline.ts. */
@@ -187,6 +193,10 @@ export function RealtimeSimulationClient({
           // than waiting for it, unlike ordinary timer expiry (see waitForCurrentExchangeToFinish).
           dispatch({ type: "END_PRACTICE" });
           connectionRef.current?.sendEvent({ type: "response.cancel" });
+          logRealtimeDebugEvent(sessionId, "response_cancelled", sessionElapsedMs(), {
+            reason: "manual_end_practice",
+            targetResponseId: responseLifecycleRef.current?.getSnapshot().activeResponseId ?? null,
+          });
           metricsRef.current?.recordResponseCancelled(null, "manual_end_practice");
         } else {
           // 0:00 means finish after the current exchange, not cut it off mid-word: let the user
@@ -295,7 +305,7 @@ export function RealtimeSimulationClient({
         };
       }
     },
-    [router, sessionId, logStage],
+    [router, sessionId, logStage, sessionElapsedMs],
   );
 
   const connect = useCallback(async () => {
@@ -329,6 +339,9 @@ export function RealtimeSimulationClient({
         { sessionId },
       );
 
+      const responseLifecycle = createResponseLifecycleTracker();
+      responseLifecycleRef.current = responseLifecycle;
+
       // Makes the actual interrupt decision instead of trusting the API's own interrupt_response
       // (disabled server-side, see session.ts) — a single VAD start event while the AI is talking
       // is exactly the acoustic-echo failure mode reported in production, so this only treats it
@@ -345,7 +358,14 @@ export function RealtimeSimulationClient({
         onConfirmedBargeIn: () => {
           if (aiAudioSpeechIncidentRef.current) aiAudioSpeechIncidentRef.current.wasInterrupted = true;
           connection.sendEvent({ type: "response.cancel" });
-          logRealtimeDebugEvent(sessionId, "response_cancelled", sessionElapsedMs(), { reason: "confirmed_bargein" });
+          // response.cancel carries no response id on the wire (it always targets whatever the
+          // server currently considers active) — targetResponseId here is OUR best-known belief at
+          // cancel time, logged so a future incident can tell whether our tracking agreed with the
+          // server about which response this was. See responseLifecycle.ts's doc comment.
+          logRealtimeDebugEvent(sessionId, "response_cancelled", sessionElapsedMs(), {
+            reason: "confirmed_bargein",
+            targetResponseId: responseLifecycle.getSnapshot().activeResponseId,
+          });
           // response.cancel alone stops the server from generating further content but does NOT
           // itself drain/stop the output audio buffer — without this, a genuinely interrupted
           // response's output_audio_buffer.stopped can arrive very late or never, leaving its AI
@@ -482,6 +502,11 @@ export function RealtimeSimulationClient({
               // every other outcome just by scanning forward in this log stream for the next
               // ai_response_created (or its absence) against this same itemId/timestamp.
               logRealtimeDebugEvent(sessionId, "automatic_response_expected", sessionElapsedMs(), { triggeringItemId: itemId });
+              // Marks this turn as awaiting a response — cleared by response.created (see
+              // responseLifecycle.ts), or retried once the active-response gate next provably
+              // clears if that expectation is never satisfied (the
+              // conversation_already_has_active_response fix).
+              responseLifecycle.recordUserSpeechStopped(itemId);
               break;
             }
             case "conversation.item.input_audio_transcription.completed": {
@@ -520,15 +545,27 @@ export function RealtimeSimulationClient({
               // before our own state caught up, during which an echo-triggered speech_started
               // would bypass the confirmation window entirely.
               const responseId = (event.response as { id?: string } | undefined)?.id;
+              // Snapshotted BEFORE recordResponseCreated updates it — this is "what we believed
+              // right before this event," the key diagnostic for the
+              // conversation_already_has_active_response fix (see responseLifecycle.ts's doc
+              // comment): previousActiveResponseId should always be null in correct operation
+              // (only one response can ever be active at a time), and pendingUserItemIdAtCreation
+              // shows which turn's expectation this response is about to satisfy, if any.
+              const lifecycleBefore = responseLifecycle.getSnapshot();
               logRealtimeDebugEvent(sessionId, "ai_response_created", sessionElapsedMs(), {
                 responseId,
                 isFirstAiResponse: isFirstAiResponseRef.current,
+                previousActiveResponseId: lifecycleBefore.activeResponseId,
+                pendingUserItemIdAtCreation: lifecycleBefore.pendingUserItemId,
               });
               bargeIn.handleAiSpeakingChanged(true);
               // Lets a confirmed barge-in that lands before this response ever produces audio
               // still be attributed to it instead of recording a null aiResponseId — see
               // sessionTimeline.ts's doc comment on this exact gap.
-              if (responseId) metricsRef.current?.recordResponseCreated(responseId);
+              if (responseId) {
+                metricsRef.current?.recordResponseCreated(responseId);
+                responseLifecycle.recordResponseCreated(responseId);
+              }
               break;
             }
             case "response.output_audio.delta": {
@@ -550,14 +587,42 @@ export function RealtimeSimulationClient({
               // backstop for clearing "AI is speaking" even if a response never actually produced
               // any audio at all, so this flag can never get stuck true from response.created above.
               const response = event.response as { id?: string; status?: string } | undefined;
+              const lifecycleBeforeDone = responseLifecycle.getSnapshot();
               logRealtimeDebugEvent(sessionId, "ai_response_done", sessionElapsedMs(), {
                 responseId: response?.id,
                 status: response?.status,
                 isFirstAiResponse: isFirstAiResponseRef.current,
+                activeResponseIdBefore: lifecycleBeforeDone.activeResponseId,
+                pendingUserItemId: lifecycleBeforeDone.pendingUserItemId,
               });
               bargeIn.handleAiSpeakingChanged(false);
               if (response?.id && response.status) {
                 metricsRef.current?.recordResponseDone(response.id, response.status as AiResponseStatus);
+              }
+              // conversation_already_has_active_response lifecycle fix (see responseLifecycle.ts's
+              // doc comment and /docs/DECISIONS.md): response.done is the authoritative,
+              // server-proven signal that the "at most one active response" slot has genuinely
+              // cleared. Only if a user turn's automatic response was never satisfied (no
+              // response.created seen since its speech_stopped) do we send exactly one recovery
+              // response.create here — never a blind/immediate retry off the error itself, and
+              // never while the session is already ending (nothing should reply once "wrapping up"
+              // has begun).
+              if (response?.id) {
+                const result = responseLifecycle.recordResponseDone(response.id);
+                if (!result.matchedActiveResponse) {
+                  console.error(
+                    "[voice:realtime] response.done id did not match the tracked active response — see responseLifecycle.ts",
+                    { doneResponseId: response.id, trackedActiveResponseId: lifecycleBeforeDone.activeResponseId },
+                  );
+                } else if (result.shouldSendRecovery && !endTriggeredRef.current) {
+                  responseLifecycle.recordRecoveryAttempted();
+                  connection.sendEvent({ type: "response.create" });
+                  logRealtimeDebugEvent(sessionId, "response_create_sent", sessionElapsedMs(), {
+                    reason: "lifecycle_recovery",
+                    recoveredForPendingUserItemId: lifecycleBeforeDone.pendingUserItemId,
+                    clearedResponseId: response.id,
+                  });
+                }
               }
               // Lifecycle-proven recovery (see /docs/DECISIONS.md "Response-stall incident", Part
               // B/G, and connectionState.ts's own doc comment on this transition): if we are still
@@ -633,11 +698,19 @@ export function RealtimeSimulationClient({
               // Also routed through the structured debug stream (with session-elapsed timing and
               // current uiState) so an error is correlatable against every other lifecycle event —
               // previously this was console.error-only, invisible in the same timeline. Note this
-              // event alone never clears "thinking"/any UI state — see the module doc comment on
-              // THINKING_STALL_TIMEOUT_MS and /docs/DECISIONS.md "Response-stall incident", Part B.
+              // event alone never clears "thinking"/any UI state and never itself sends a retry —
+              // see the module doc comment on THINKING_STALL_TIMEOUT_MS, responseLifecycle.ts's own
+              // doc comment on why an immediate retry here would be unsafe, and /docs/DECISIONS.md
+              // "Response-stall incident", Part B. currentActiveResponseId/pendingUserItemId are
+              // logged here (this tracker's belief AT THE MOMENT of the error) specifically so a
+              // conversation_already_has_active_response incident is never diagnosed from
+              // timestamps alone again — the actual lifecycle-gated recovery happens in
+              // response.done above, once the active-response gate provably clears.
               logRealtimeDebugEvent(sessionId, "realtime_error", sessionElapsedMs(), {
                 uiState: stateRef.current,
                 error: event.error,
+                currentActiveResponseId: responseLifecycle.getSnapshot().activeResponseId,
+                pendingUserItemId: responseLifecycle.getSnapshot().pendingUserItemId,
               });
               break;
             default:
@@ -762,8 +835,26 @@ export function RealtimeSimulationClient({
       type: "conversation.item.create",
       item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
     });
-    connection.sendEvent({ type: "response.create" });
-    logRealtimeDebugEvent(sessionId, "response_create_sent", sessionElapsedMs(), { reason: "text_fallback" });
+
+    // Same conversation_already_has_active_response protection as the automatic voice path (see
+    // responseLifecycle.ts's doc comment): this is the one OTHER call site that manually sends
+    // response.create for a genuine user turn (the opening line is the session's very first event,
+    // so it can never race). Mark the expectation first, then only send immediately if the gate is
+    // actually clear right now — if not, the pending expectation is picked up automatically by the
+    // same lifecycle-gated recovery in the response.done handler once whatever IS active finishes,
+    // rather than risking the identical error here too.
+    const responseLifecycle = responseLifecycleRef.current;
+    const textItemMarker = `text_fallback_${Date.now()}`;
+    responseLifecycle?.recordUserSpeechStopped(textItemMarker);
+    if (!responseLifecycle || !responseLifecycle.hasActiveResponse()) {
+      connection.sendEvent({ type: "response.create" });
+      logRealtimeDebugEvent(sessionId, "response_create_sent", sessionElapsedMs(), { reason: "text_fallback" });
+    } else {
+      logRealtimeDebugEvent(sessionId, "response_create_deferred", sessionElapsedMs(), {
+        reason: "text_fallback",
+        activeResponseId: responseLifecycle.getSnapshot().activeResponseId,
+      });
+    }
   }
 
   function handleRetry() {

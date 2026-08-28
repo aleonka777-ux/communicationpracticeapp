@@ -44,7 +44,10 @@ export type RealtimeDebugEvent =
   | "first_output_audio_delta"
   | "output_audio_buffer_clear_sent"
   | "realtime_error"
-  | "thinking_stall_detected";
+  | "thinking_stall_detected"
+  // Added for the conversation_already_has_active_response lifecycle fix — see
+  // src/lib/realtime/responseLifecycle.ts's module doc comment and /docs/DECISIONS.md.
+  | "response_create_deferred";
 
 export function logRealtimeDebugEvent(
   sessionId: string,
