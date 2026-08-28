@@ -100,8 +100,11 @@ export interface SpeechDeliveryTracker {
  *  to be cheap. See the module doc comment; not a promise of finer time resolution than this. */
 export const DEFAULT_SAMPLE_INTERVAL_MS = 50;
 
-/** See the module doc comment's pause-threshold rationale. */
-const MIN_INTRA_PAUSE_MS = 250;
+/** See the module doc comment's pause-threshold rationale. Exported for reuse by
+ *  src/lib/semanticResponse/grouping.ts, which must decide whether a gap BETWEEN two grouped raw
+ *  turns is a meaningful pause using this exact, already-justified threshold rather than inventing
+ *  a second one — see /docs/DECISIONS.md "Phase 4B.1A: Semantic Response Foundation". */
+export const MIN_INTRA_PAUSE_MS = 250;
 
 const NOISE_FLOOR_RELEASE_RATE = 0.01;
 const SPEECH_THRESHOLD_MULTIPLIER = 3;

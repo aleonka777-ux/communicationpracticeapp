@@ -196,6 +196,10 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         message_id: null,
         user_turn_classification: t.classification,
         transcription_failed: t.transcriptionFailed,
+        // Previously discarded here despite already being validated on the payload — see
+        // supabase/migrations/0016_semantic_responses.sql for why this was fixed (Phase 4B.1A's
+        // combined-transcript evidence needs it, and there was no other way to obtain it).
+        transcript: t.transcript,
         barge_in_context: null,
         counts_toward_interruption: null,
         audible_ai_response_id_at_start: t.audibleAiResponseIdAtStart,
@@ -225,6 +229,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         message_id: null,
         user_turn_classification: null,
         transcription_failed: null,
+        transcript: null,
         barge_in_context: null,
         counts_toward_interruption: null,
         audible_ai_response_id_at_start: null,
@@ -254,6 +259,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         message_id: null,
         user_turn_classification: null,
         transcription_failed: null,
+        transcript: null,
         barge_in_context: null,
         counts_toward_interruption: null,
         audible_ai_response_id_at_start: null,
@@ -283,6 +289,7 @@ export function mapMetricsPayloadToTurnEvents(body: MetricsPayload): RealtimeTur
         message_id: null,
         user_turn_classification: null,
         transcription_failed: null,
+        transcript: null,
         barge_in_context: b.context,
         counts_toward_interruption: b.countsTowardInterruption,
         audible_ai_response_id_at_start: null,

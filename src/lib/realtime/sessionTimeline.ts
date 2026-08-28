@@ -553,7 +553,11 @@ export interface SessionTimeline {
  * comfortably (10x+) above any observed legitimate segmentation gap and far below any real stall,
  * so it distinguishes the two without needing a fragile hair-splitting threshold.
  */
-const MIN_UNANSWERED_GAP_MS = 2000;
+/** Exported for reuse by src/lib/semanticResponse/grouping.ts, which needs the same "ordinary
+ *  VAD-segmented continuation vs. genuine gap" boundary this constant already establishes here —
+ *  see /docs/DECISIONS.md "Phase 4B.1A: Semantic Response Foundation" for why that module reuses
+ *  this exact threshold instead of inventing a new one. */
+export const MIN_UNANSWERED_GAP_MS = 2000;
 
 function average(values: number[]): number | null {
   if (values.length === 0) return null;
@@ -567,16 +571,21 @@ function median(values: number[]): number | null {
   return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
-/** Literal whitespace tokenization — see UserTurnMetric.wordCount's doc comment. */
-function countWords(transcript: string): number {
+/** Literal whitespace tokenization — see UserTurnMetric.wordCount's doc comment. Exported for reuse
+ *  by src/lib/semanticResponse/build.ts, which must tokenize a combined multi-turn transcript with
+ *  IDENTICAL semantics to per-turn wordCount, per the explicit "preserve consistency with current
+ *  Phase 4A semantics" requirement — a duplicated implementation could silently drift. */
+export function countWords(transcript: string): number {
   const trimmed = transcript.trim();
   if (trimmed.length === 0) return 0;
   return trimmed.split(/\s+/).length;
 }
 
 /** A turn shorter than this many words produces a WPM figure dominated by turn-boundary VAD timing
- *  noise rather than real articulation rate — see UserTurnMetric.speakingRateWpm's doc comment. */
-const MIN_WORDS_FOR_RATE = 3;
+ *  noise rather than real articulation rate — see UserTurnMetric.speakingRateWpm's doc comment.
+ *  Exported for reuse by src/lib/semanticResponse/build.ts — a semantic response's own WPM applies
+ *  the identical floor, for the identical reason, rather than a separately-tuned value. */
+export const MIN_WORDS_FOR_RATE = 3;
 
 /** Simple ordinary-least-squares slope of y against x = 0..n-1 (turn order). Null for fewer than 3
  *  points — see SessionLevelMetrics.wpmTrendSlopePerTurn's doc comment. */

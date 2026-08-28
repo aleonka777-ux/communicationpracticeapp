@@ -8,6 +8,7 @@ import {
   saveRealtimeTurnEvents,
   upsertRealtimeSessionMetrics,
 } from "@/lib/db/realtimeMetrics";
+import { computeAndPersistSemanticResponses } from "@/lib/db/semanticResponses";
 import {
   mapMetricsPayloadToFillerCandidates,
   mapMetricsPayloadToPauseEvents,
@@ -45,6 +46,17 @@ export async function POST(request: Request) {
     await saveRealtimePauseEvents(supabase, sessionId, mapMetricsPayloadToPauseEvents(body));
     await saveRealtimeDisfluencyCandidates(supabase, sessionId, mapMetricsPayloadToFillerCandidates(body));
     await upsertRealtimeSessionMetrics(supabase, sessionId, mapMetricsPayloadToSessionMetrics(body));
+
+    // Phase 4B.1A: derived, failure-isolated analytics layer. Deliberately isolated in its own
+    // try/catch, exactly like the Phase 4A speech-delivery merge in realtime-simulation-client.tsx
+    // — a grouping failure must never affect the raw metrics this request already successfully
+    // persisted, nor this response, nor the client's subsequent /api/practice/end call. Not yet
+    // read by the Evaluation Engine or any production UI (see /docs/DECISIONS.md).
+    try {
+      await computeAndPersistSemanticResponses(supabase, sessionId);
+    } catch (error) {
+      console.error("[semantic-response] compute/persist failed (raw metrics unaffected)", error instanceof Error ? error.message : error);
+    }
 
     return NextResponse.json({ ok: true });
   } catch (error) {

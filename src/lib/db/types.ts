@@ -211,6 +211,11 @@ export interface RealtimeTurnEventRow {
   message_id: string | null;
   user_turn_classification: RealtimeUserTurnClassification | null;
   transcription_failed: boolean | null;
+  /** user_turn rows only. The turn's final transcript text, verbatim — see
+   *  src/lib/realtime/sessionTimeline.ts's UserTurnMetric.transcript. Null for every other kind, or
+   *  when no transcript exists. Added for Phase 4B.1A's combined-transcript evidence — see
+   *  supabase/migrations/0016_semantic_responses.sql. */
+  transcript: string | null;
   barge_in_context: RealtimeBargeInContext | null;
   /** confirmed_barge_in rows only. False for a repeat confirmation against an AI response already
    *  counted as interrupted, or for a pre_playback context. See
@@ -338,6 +343,55 @@ export interface RealtimeSessionMetricsRow {
   computed_at: string;
 }
 
+/**
+ * Phase 4B.1A: one row per Semantic Response — one or more adjacent CONFIRMED raw user turns
+ * (realtime_turn_events) grouped by deterministic interaction/timing evidence only. See
+ * supabase/migrations/0016_semantic_responses.sql and src/lib/semanticResponse/*.
+ */
+export interface SemanticResponseRow {
+  id: string;
+  session_id: string;
+  response_index: number;
+  grouping_algorithm_version: string;
+  start_ms: number;
+  end_ms: number;
+  span_duration_ms: number;
+  /** 'high' for any multi-turn merge (Phase 4B.1A only ever auto-merges at high confidence); null
+   *  for a singleton response (no merge decision was made). Not enum-constrained at the DB level —
+   *  a future Phase 4B.1B may introduce additional tiers. */
+  grouping_confidence: string | null;
+  grouping_reasons: string[];
+  preceding_boundary_decision: "merge" | "separate" | "ambiguous" | null;
+  preceding_boundary_gap_ms: number | null;
+  preceding_ai_response_id: string | null;
+  response_latency_ms: number | null;
+  transcript_coverage: "complete" | "partial" | "missing";
+  combined_transcript: string | null;
+  word_count: number | null;
+  semantic_response_wpm: number | null;
+  avg_relative_intensity: number | null;
+  peak_relative_intensity: number | null;
+  intensity_variability: number | null;
+  started_while_ai_speaking: boolean | null;
+  user_interrupted_ai: boolean | null;
+  was_interrupted_by_ai: boolean | null;
+  computed_at: string;
+}
+
+/**
+ * Phase 4B.1A: one row per constituent raw user turn within a SemanticResponseRow, in chronological
+ * order, carrying the bridge-gap evidence to the previous turn in the same response.
+ */
+export interface SemanticResponseTurnRow {
+  id: string;
+  session_id: string;
+  semantic_response_id: string;
+  realtime_item_id: string;
+  turn_order_in_response: number;
+  gap_before_ms: number | null;
+  gap_counts_as_meaningful_pause: boolean | null;
+}
+
 /** Matches the classic @supabase/postgrest-js generated-types shape (Row/Insert/Update per table). */
 type Table<Row, Insert> = { Row: Row; Insert: Insert; Update: Partial<Row> };
 
@@ -354,6 +408,8 @@ export interface Database {
       realtime_session_metrics: Table<RealtimeSessionMetricsRow, Omit<RealtimeSessionMetricsRow, "id" | "computed_at">>;
       realtime_pause_events: Table<RealtimePauseEventRow, Omit<RealtimePauseEventRow, "id" | "created_at">>;
       realtime_disfluency_candidates: Table<RealtimeDisfluencyCandidateRow, Omit<RealtimeDisfluencyCandidateRow, "id" | "created_at">>;
+      semantic_responses: Table<SemanticResponseRow, Omit<SemanticResponseRow, "id" | "computed_at">>;
+      semantic_response_turns: Table<SemanticResponseTurnRow, Omit<SemanticResponseTurnRow, "id">>;
     };
     Views: Record<string, never>;
     Functions: Record<string, never>;
