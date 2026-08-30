@@ -83,6 +83,18 @@ export async function uploadManualAction(formData: FormData): Promise<void> {
  * (only if parsing did not hit a fatal structural error — see ManualValidationReport.fatal) replaces
  * its block set and marks it `parsed`. Safe to re-run: parsing/validation happens fully in memory
  * before anything is persisted (see src/lib/manual/parseAndValidate.ts).
+ *
+ * Deliberately does NOT redirect: the "Parse Manual" button is submitted from
+ * /admin/manual/[id], the very page that should show the result, so there is nowhere to navigate
+ * to — `revalidatePath` alone is enough for Next.js to refresh that page's Server Component with
+ * the freshly written data once this action resolves. Redirecting to the exact same URL the form
+ * was submitted from (as this action previously did) hits a known Next.js App Router
+ * client-navigation edge case for same-URL redirects issued from a plain `<form action={...}>`:
+ * the pending transition never resolves into the new RSC payload, leaving only the surrounding
+ * admin layout (top nav/header) visible until an unrelated, fresh navigation (e.g. clicking a
+ * sidebar link) forces a real refetch. Every other action in this file/actions.ts redirects to a
+ * genuinely different URL (a list page, or a newly created row's own detail page) and is
+ * unaffected — this was the only self-redirect.
  */
 export async function parseManualAction(formData: FormData): Promise<void> {
   const { supabase } = await requireAdmin();
@@ -115,5 +127,4 @@ export async function parseManualAction(formData: FormData): Promise<void> {
 
   revalidatePath("/admin/manual");
   revalidatePath(`/admin/manual/${versionId}`);
-  redirect(`/admin/manual/${versionId}`);
 }
