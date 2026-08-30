@@ -16,6 +16,11 @@ export function isCoach(profile: ProfileRow | null): boolean {
   return profile?.role === "coach";
 }
 
+/** Platform administrator. Distinct from isCoach() — a coach is never an admin by this check. */
+export function isAdmin(profile: ProfileRow | null): boolean {
+  return profile?.role === "admin";
+}
+
 export async function updateDisplayName(
   supabase: SupabaseClient<Database>,
   userId: string,

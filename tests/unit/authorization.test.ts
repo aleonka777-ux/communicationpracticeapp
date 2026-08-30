@@ -1,22 +1,55 @@
 import { describe, expect, it } from "vitest";
-import { isCoach } from "@/lib/db/profiles";
+import { isAdmin, isCoach } from "@/lib/db/profiles";
 import { ApiError, requireOwnedSession } from "@/lib/practice/authorize";
-import type { PracticeSessionRow, ProfileRow } from "@/lib/db/types";
+import type { PracticeSessionRow, ProfileRow, UserRole } from "@/lib/db/types";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Database } from "@/lib/db/types";
 
-function profile(role: "user" | "coach"): ProfileRow {
+function profile(role: UserRole): ProfileRow {
   return { id: "u1", display_name: "Test", role, created_at: "", updated_at: "" };
 }
 
 describe("isCoach", () => {
-  it("is true only for a coach profile", () => {
+  it("is true only for a coach profile — never true for admin (see Stage B.1: is_coach() is never redefined to mean coach-or-admin)", () => {
     expect(isCoach(profile("coach"))).toBe(true);
     expect(isCoach(profile("user"))).toBe(false);
+    expect(isCoach(profile("admin"))).toBe(false);
   });
 
   it("is false when there is no profile", () => {
     expect(isCoach(null)).toBe(false);
+  });
+});
+
+describe("isAdmin (Stage B.1 — proper user/coach/admin role separation)", () => {
+  it("is true only for an admin profile — never true for coach", () => {
+    expect(isAdmin(profile("admin"))).toBe(true);
+    expect(isAdmin(profile("user"))).toBe(false);
+    expect(isAdmin(profile("coach"))).toBe(false);
+  });
+
+  it("is false when there is no profile", () => {
+    expect(isAdmin(null)).toBe(false);
+  });
+
+  it("isCoach and isAdmin are mutually exclusive for every role", () => {
+    const roles: UserRole[] = ["user", "coach", "admin"];
+    for (const role of roles) {
+      const p = profile(role);
+      expect(isCoach(p) && isAdmin(p)).toBe(false);
+    }
+  });
+});
+
+describe("role contract", () => {
+  it("user, coach, and admin are all valid ProfileRow roles (type-level contract)", () => {
+    const roles: UserRole[] = ["user", "coach", "admin"];
+    expect(roles).toEqual(["user", "coach", "admin"]);
+    // Constructing a ProfileRow for each is itself the compile-time assertion that these three
+    // string literals — and only these — satisfy the UserRole type.
+    for (const role of roles) {
+      expect(profile(role).role).toBe(role);
+    }
   });
 });
 

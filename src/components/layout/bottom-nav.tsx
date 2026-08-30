@@ -10,9 +10,9 @@ const items = [
   { href: "/history", label: "History", icon: History },
 ] as const;
 
-export function BottomNav({ isCoach }: { isCoach: boolean }) {
+export function BottomNav({ isAdmin }: { isAdmin: boolean }) {
   const pathname = usePathname();
-  const allItems = isCoach ? [...items, { href: "/admin", label: "Coach", icon: ShieldCheck }] : items;
+  const allItems = isAdmin ? [...items, { href: "/admin", label: "Admin", icon: ShieldCheck }] : items;
 
   return (
     <nav

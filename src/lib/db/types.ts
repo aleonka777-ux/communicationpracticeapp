@@ -3,7 +3,7 @@
  * Keep in sync with the migrations by hand (no ORM/codegen — see /docs/DECISIONS.md).
  */
 
-export type UserRole = "user" | "coach";
+export type UserRole = "user" | "coach" | "admin";
 export type PracticeMode = "realistic" | "training";
 export type DurationSeconds = 120 | 180 | 300;
 export type SessionStatus = "in_progress" | "evaluating" | "completed" | "abandoned";

@@ -3,23 +3,27 @@
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
-import { getCurrentProfile, isCoach } from "@/lib/db/profiles";
+import { getCurrentProfile, isAdmin } from "@/lib/db/profiles";
 import { createTool, updateTool } from "@/lib/db/tools";
 import { createScenario, updateScenario } from "@/lib/db/scenarios";
 import { parseCriteria, parseLines, parseOptionalWeights, parseSteps, parseWeights, slugify } from "@/lib/admin/forms";
 import type { EmotionalIntensity, Difficulty } from "@/lib/db/types";
 
-async function requireCoach() {
+// Communication tools and scenarios are global, platform-wide content — managing them is platform
+// administration, not coach functionality (see CLAUDE.md / the Stage B.1 task's product model). A
+// coach account must not be able to create/edit/delete this content, so this checks isAdmin(), not
+// isCoach().
+async function requireAdmin() {
   const supabase = await createClient();
   const profile = await getCurrentProfile(supabase);
-  if (!isCoach(profile)) {
-    throw new Error("Only coach accounts can manage communication tools and scenarios.");
+  if (!isAdmin(profile)) {
+    throw new Error("Only admin accounts can manage communication tools and scenarios.");
   }
   return supabase;
 }
 
 export async function saveToolAction(formData: FormData): Promise<void> {
-  const supabase = await requireCoach();
+  const supabase = await requireAdmin();
 
   const id = String(formData.get("id") ?? "").trim();
   const name = String(formData.get("name") ?? "").trim();
@@ -56,7 +60,7 @@ export async function saveToolAction(formData: FormData): Promise<void> {
 }
 
 export async function saveScenarioAction(formData: FormData): Promise<void> {
-  const supabase = await requireCoach();
+  const supabase = await requireAdmin();
 
   const id = String(formData.get("id") ?? "").trim();
   const toolId = String(formData.get("tool_id") ?? "").trim();

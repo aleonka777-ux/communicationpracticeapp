@@ -3,7 +3,7 @@
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
-import { getCurrentProfile, isCoach } from "@/lib/db/profiles";
+import { getCurrentProfile, isAdmin } from "@/lib/db/profiles";
 import {
   createDraftManualVersion,
   getManualVersionById,
@@ -17,11 +17,14 @@ import { parseAndValidateManual } from "@/lib/manual/parseAndValidate";
 import { sha256Hex } from "@/lib/manual/hash";
 import { isStageBAllowedTransition, type ManualLifecycleStatus } from "@/lib/manual/lifecycle";
 
-async function requireCoach() {
+// Manual administration is platform administration, not coach functionality (see CLAUDE.md / the
+// Stage B.1 task's product model) — a coach must not be able to upload/parse the Manual, so this
+// checks isAdmin(), not isCoach().
+async function requireAdmin() {
   const supabase = await createClient();
   const profile = await getCurrentProfile(supabase);
-  if (!isCoach(profile)) {
-    throw new Error("Only coach accounts can manage the Communication Manual.");
+  if (!isAdmin(profile)) {
+    throw new Error("Only admin accounts can manage the Communication Manual.");
   }
   return { supabase, profile };
 }
@@ -33,7 +36,7 @@ async function requireCoach() {
  * methodology version is immutable once represented in the system.
  */
 export async function uploadManualAction(formData: FormData): Promise<void> {
-  const { supabase, profile } = await requireCoach();
+  const { supabase, profile } = await requireAdmin();
 
   const file = formData.get("source");
   if (!(file instanceof File) || file.size === 0) {
@@ -82,7 +85,7 @@ export async function uploadManualAction(formData: FormData): Promise<void> {
  * before anything is persisted (see src/lib/manual/parseAndValidate.ts).
  */
 export async function parseManualAction(formData: FormData): Promise<void> {
-  const { supabase } = await requireCoach();
+  const { supabase } = await requireAdmin();
 
   const versionId = String(formData.get("id") ?? "").trim();
   if (!versionId) throw new Error("Missing manual version id.");
