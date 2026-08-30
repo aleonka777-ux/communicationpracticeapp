@@ -4,8 +4,8 @@ import { logInAction } from "@/lib/auth/actions";
 export default async function LoginPage({
   searchParams,
 }: {
-  searchParams: Promise<{ next?: string }>;
+  searchParams: Promise<{ next?: string; resetSuccess?: string }>;
 }) {
-  const { next } = await searchParams;
-  return <AuthForm mode="login" action={logInAction} next={next} />;
+  const { next, resetSuccess } = await searchParams;
+  return <AuthForm mode="login" action={logInAction} next={next} resetSuccess={resetSuccess === "1"} />;
 }

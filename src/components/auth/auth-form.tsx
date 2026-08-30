@@ -20,16 +20,23 @@ export function AuthForm({
   mode,
   action,
   next,
+  resetSuccess = false,
 }: {
   mode: "login" | "signup";
   action: (state: AuthActionState, formData: FormData) => Promise<AuthActionState>;
   next?: string;
+  resetSuccess?: boolean;
 }) {
   const [state, formAction] = useActionState(action, { error: null });
 
   return (
     <form action={formAction} className="flex flex-col gap-4">
       {next ? <input type="hidden" name="next" value={next} /> : null}
+      {mode === "login" && resetSuccess ? (
+        <p className="rounded-xl bg-accent-green/10 px-4 py-2 text-sm text-accent-green" role="status">
+          Password updated. Sign in with your new password.
+        </p>
+      ) : null}
       {mode === "signup" ? (
         <div className="flex flex-col gap-1.5">
           <Label htmlFor="displayName">Name</Label>
@@ -41,7 +48,14 @@ export function AuthForm({
         <Input id="email" name="email" type="email" autoComplete="email" required placeholder="you@example.com" />
       </div>
       <div className="flex flex-col gap-1.5">
-        <Label htmlFor="password">Password</Label>
+        <div className="flex items-center justify-between">
+          <Label htmlFor="password">Password</Label>
+          {mode === "login" ? (
+            <Link href="/forgot-password" className="text-sm font-medium text-primary">
+              Forgot password?
+            </Link>
+          ) : null}
+        </div>
         <Input
           id="password"
           name="password"
