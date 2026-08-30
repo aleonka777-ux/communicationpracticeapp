@@ -392,6 +392,55 @@ export interface SemanticResponseTurnRow {
   gap_counts_as_meaningful_pause: boolean | null;
 }
 
+export type ManualLifecycleStatus = "draft" | "parsed" | "validated" | "active" | "archived";
+
+/**
+ * Stage B: one row per uploaded Communication Manual source version — see
+ * supabase/migrations/0017_manual_infrastructure.sql. `status` is the DB lifecycle state; it is a
+ * distinct concept from `document_metadata.status`, which is the Manual's own textual "Status:"
+ * header line (e.g. "Implementation-ready methodology contract for V1") — never confuse the two.
+ */
+export interface ManualVersionRow {
+  id: string;
+  version_label: string;
+  status: ManualLifecycleStatus;
+  source_filename: string;
+  source_markdown: string;
+  source_sha256: string;
+  parser_version: string | null;
+  block_count: number;
+  parse_report: Record<string, unknown> | null;
+  document_metadata: Record<string, unknown> | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+  parsed_at: string | null;
+  validated_at: string | null;
+  activated_at: string | null;
+  archived_at: string | null;
+}
+
+/**
+ * Stage B: one atomic retrievable block parsed from a manual_versions row's source. Not read by the
+ * Evaluation Engine in this stage — see CLAUDE.md Stage B scope boundary.
+ */
+export interface ManualBlockRow {
+  id: string;
+  manual_version_id: string;
+  block_id: string;
+  block_type: string | null;
+  title: string | null;
+  priority: string | null;
+  status: string | null;
+  ordinal: number;
+  section_path: string[];
+  metadata: Record<string, unknown>;
+  body_markdown: string;
+  content_hash: string;
+  related_block_ids: string[];
+  created_at: string;
+}
+
 /** Matches the classic @supabase/postgrest-js generated-types shape (Row/Insert/Update per table). */
 type Table<Row, Insert> = { Row: Row; Insert: Insert; Update: Partial<Row> };
 
@@ -410,6 +459,8 @@ export interface Database {
       realtime_disfluency_candidates: Table<RealtimeDisfluencyCandidateRow, Omit<RealtimeDisfluencyCandidateRow, "id" | "created_at">>;
       semantic_responses: Table<SemanticResponseRow, Omit<SemanticResponseRow, "id" | "computed_at">>;
       semantic_response_turns: Table<SemanticResponseTurnRow, Omit<SemanticResponseTurnRow, "id">>;
+      manual_versions: Table<ManualVersionRow, Omit<ManualVersionRow, "id" | "created_at" | "updated_at">>;
+      manual_blocks: Table<ManualBlockRow, Omit<ManualBlockRow, "id" | "created_at">>;
     };
     Views: Record<string, never>;
     Functions: Record<string, never>;

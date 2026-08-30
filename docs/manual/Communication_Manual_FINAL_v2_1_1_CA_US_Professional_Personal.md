@@ -565,7 +565,7 @@ improved.
 user fragments resolves, under the current grouping algorithm, to exactly one
 of:
 
-```yaml
+```text
 merge      # the fragments are treated as one semantic response
 separate   # the fragments are treated as distinct semantic responses
 ambiguous  # the algorithm found no high-confidence basis for either
@@ -927,6 +927,7 @@ than by national baseline.
 
 ```yaml
 id: reg_position
+type: cultural_rule
 contexts: [disagreement, giving_negative_feedback, difficult_request,
            self_advocacy, criticism_unfair]
 priority: high
@@ -952,6 +953,7 @@ acknowledgment; whether it survives pushback.
 
 ```yaml
 id: reg_disagreement
+type: cultural_rule
 contexts: [disagreement, criticism_unfair, negotiation]
 priority: high
 ```
@@ -970,6 +972,7 @@ priority: high
 
 ```yaml
 id: reg_ack_before_disagree
+type: cultural_rule
 contexts: [disagreement, criticism_fair, criticism_unfair, aggression,
            giving_negative_feedback]
 priority: high
@@ -990,6 +993,7 @@ Acknowledgment is not agreement.
 
 ```yaml
 id: reg_request
+type: cultural_rule
 contexts: [difficult_request, negotiation]
 priority: high
 ```
@@ -1011,6 +1015,7 @@ whether the request is actionable and appropriately calibrated to relationship a
 
 ```yaml
 id: reg_refusal
+type: cultural_rule
 contexts: [difficult_request, boundary_violation, negotiation]
 priority: high
 ```
@@ -1028,6 +1033,7 @@ priority: high
 
 ```yaml
 id: reg_credit
+type: cultural_rule
 contexts: [self_advocacy, receiving_positive_feedback]
 priority: high
 ```
@@ -1047,6 +1053,7 @@ priority: high
 
 ```yaml
 id: reg_apology
+type: cultural_rule
 contexts: [criticism_fair, criticism_unfair, upset_person, boundary_violation]
 priority: high
 signals: [apology_type, apology_count]
@@ -1073,6 +1080,7 @@ Apology forms are classified by function before they are evaluated:
 
 ```yaml
 id: reg_small_talk
+type: cultural_rule
 contexts: [meeting_open, difficult_request, negotiation, self_advocacy]
 priority: medium
 ```
@@ -1091,6 +1099,7 @@ priority: medium
 
 ```yaml
 id: reg_giving_feedback
+type: cultural_rule
 contexts: [giving_negative_feedback]
 priority: high
 ```
@@ -1110,6 +1119,7 @@ Country never justifies vague feedback.
 
 ```yaml
 id: reg_receiving_feedback
+type: cultural_rule
 contexts: [criticism_fair, criticism_unfair]
 priority: high
 ```
@@ -1127,6 +1137,7 @@ priority: high
 
 ```yaml
 id: reg_pause
+type: cultural_rule
 contexts: [aggression, criticism_unfair, criticism_fair, negotiation, upset_person]
 priority: high
 signals: [response_latency, intra_response_pause]
@@ -1152,6 +1163,7 @@ The evaluator assesses **function**, not duration alone.
 
 ```yaml
 id: reg_interruption
+type: cultural_rule
 contexts: [disagreement, negotiation, aggression, meeting_open]
 priority: medium
 signals: [interruptions, floor_share]
@@ -1171,6 +1183,7 @@ signals: [interruptions, floor_share]
 
 ```yaml
 id: reg_questions
+type: cultural_rule
 contexts: [criticism_fair, criticism_unfair, disagreement, indirect_signal,
            soft_no, negotiation, upset_person]
 priority: high
@@ -1189,6 +1202,7 @@ priority: high
 
 ```yaml
 id: reg_empathy
+type: cultural_rule
 contexts: [upset_person, criticism_fair, aggression, relationship_repair]
 priority: high
 ```
@@ -1208,6 +1222,7 @@ been received before moving past it when the situation calls for that.
 
 ```yaml
 id: reg_meeting_participation
+type: cultural_rule
 contexts: [meeting_open, disagreement, self_advocacy]
 priority: medium
 ```
@@ -1225,6 +1240,7 @@ priority: medium
 
 ```yaml
 id: reg_negotiation
+type: cultural_rule
 contexts: [negotiation]
 priority: high
 ```
@@ -1244,6 +1260,7 @@ priority: high
 
 ```yaml
 id: reg_closing
+type: cultural_rule
 contexts: [criticism_fair, difficult_request, negotiation, giving_negative_feedback,
            boundary_violation]
 priority: high
@@ -4510,7 +4527,8 @@ priority: high
   rule_ids: [tool_impact_self_advocacy, reg_credit]
   evaluation_market: canada
   context_type: receiving_positive_feedback
-  fragment: 'User: "Honestly, it was really the team. I didn't do much."'
+  fragment: >
+    User: "Honestly, it was really the team. I didn't do much."
   expected_finding: credit_erased
   must_not_report_as: canadian_modesty
 
@@ -5420,6 +5438,14 @@ rule — is unchanged in substance.
 - Added `id: ret_metadata_schema` (§1.8): a single retrievable block defining the intended
   meaning, cardinality, optionality, and scenario-vs-block inheritance of every metadata field
   used in this Manual.
+- Pre-ingestion structural cleanup, found by the versioned Manual parser before this source was
+  first uploaded into the Manual infrastructure: YAML syntax cleanup for machine-readable
+  fences — the `ev_04` boundary-states example fence is now labelled ` ```text ` instead of
+  ` ```yaml ` (it was always illustrative pseudo-syntax, never machine-readable YAML), and
+  `val_01`'s `ex_013.fragment` now uses a block scalar instead of a single-quoted string that an
+  internal apostrophe was terminating early; and explicit `type: cultural_rule` metadata added to
+  the seventeen `reg_*` country contrast-rule blocks in §4.7-4.23, alongside `reg_us_base`/
+  `reg_ca_base`, which already carried it.
 - Wrapped the "Decisions in force" table and §1.6 in proper `id`-bearing blocks
   (`manual_decisions`, `ret_runtime_contract`) so this content survives being retrieved on its
   own, per `ret_01`'s own retrieval contract.
